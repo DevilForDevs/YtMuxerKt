@@ -1,4 +1,5 @@
 package org.ytmuxer.mpfour
+import org.ytmuxer.webm.convertBytes
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -47,47 +48,41 @@ class DashedParser(val reader: RandomAccessFile,private val doLogging: Boolean,p
     fun parse() {
         reader.seek(baseOffset)
 
-        // Keep going while we can read at least a size+type (8 bytes)
         while (reader.filePointer + 8 <= baseEndOffset) {
             val startOffset = reader.filePointer
 
-            // 1) Read box size
             val size = reader.readInt().toLong()
-            if (size < 8) {
-                throw IllegalStateException("Invalid box size $size at offset $startOffset")
-            }
+            if (size < 8) throw IllegalStateException("Invalid box size $size at offset $startOffset")
 
-            // 2) Read box type (4 ASCII bytes)
             val typeBytes = ByteArray(4).also { reader.readFully(it) }
             val boxType = String(typeBytes, Charsets.US_ASCII)
 
-            // Record it
+            if (doLogging) {
+                println("Box $boxType At: $startOffset  Size: ${convertBytes(size)}")
+            }
+
             currentBox = Box(type = boxType, offset = startOffset, size = size)
 
-
-            // 3) Handle moov / moof
             when (boxType) {
                 "moov" -> {
-                    val payloadSize = (size - 8).toInt()
-                    val payload = ByteArray(payloadSize)
+                    val payload = ByteArray((size - 8).toInt())
                     reader.readFully(payload)
-                    parseMoov(payload)
+                    parseMoov(payload, doLogging)
                 }
                 "moof" -> {
                     moofs.add(Box(type = boxType, offset = startOffset, size = size))
-                    val payloadSize = (size - 8).toInt()
-                    val payload = ByteArray(payloadSize)
+                    val payload = ByteArray((size - 8).toInt())
                     reader.readFully(payload)
-
                     countSamplesInMoof(payload)
                 }
+                else -> {
+                    // skip other boxes
+                    reader.seek(startOffset + size)
+                }
             }
-
-            // 4) Skip to the next box header
-            reader.seek(startOffset + size)
         }
-
     }
+
 
     fun countSamplesInMoof(moofData: ByteArray): Int {
         val buffer = ByteBuffer.wrap(moofData).order(ByteOrder.BIG_ENDIAN)
@@ -136,7 +131,7 @@ class DashedParser(val reader: RandomAccessFile,private val doLogging: Boolean,p
 
 
 
-    fun parseMoov(payload: ByteArray) {
+    fun parseMoov(payload: ByteArray,doLogging: Boolean) {
         val buffer = ByteBuffer.wrap(payload)
         while (buffer.remaining() >= 8) {
             val boxStart = buffer.position()
@@ -144,14 +139,24 @@ class DashedParser(val reader: RandomAccessFile,private val doLogging: Boolean,p
             val boxType = buffer.int
 
             when (boxType) {
-                0x6D766864 -> parseMvhd(buffer.slice().limit(boxSize - 8) as ByteBuffer) // "mvhd"
-                0x7472616B -> parseTrak(buffer.slice().limit(boxSize - 8) as ByteBuffer) // "trak"
+                0x6D766864 -> {
+                    if (doLogging){
+                        println("Box $boxType At: $boxStart  Size: ${convertBytes(boxSize.toLong())}")
+                    }
+                    parseMvhd(buffer.slice().limit(boxSize - 8) as ByteBuffer,doLogging)
+                } // "mvhd"
+                0x7472616B -> {
+                    if (doLogging){
+                        println("Box $boxType At: $boxStart  Size: ${convertBytes(boxSize.toLong())}")
+                    }
+                    parseTrak(buffer.slice().limit(boxSize - 8) as ByteBuffer)
+                } // "trak"
             }
             buffer.position(boxStart + boxSize)
         }
     }
 
-    fun parseMvhd(buffer: ByteBuffer) {
+    fun parseMvhd(buffer: ByteBuffer,doLogging: Boolean) {
 
         val version = buffer.get().toInt()
         buffer.get() // flags
@@ -162,12 +167,19 @@ class DashedParser(val reader: RandomAccessFile,private val doLogging: Boolean,p
             buffer.long // modification_time
             movieTimescale = buffer.int
             movieDuration = buffer.long
+            if (doLogging){
+                println("Box: Mvhd MovieTimescale: $movieTimescale  Movie Duration: $movieDuration")
+            }
+
 
         } else {
             buffer.int
             buffer.int
             movieTimescale = buffer.int
             movieDuration = buffer.int.toLong()
+            if (doLogging){
+                println("Box: Mvhd MovieTimescale: $movieTimescale  Movie Duration: $movieDuration")
+            }
         }
 
 

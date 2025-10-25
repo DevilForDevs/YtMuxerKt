@@ -7,11 +7,15 @@ import java.nio.ByteBuffer
 
 
 
-class WebmMuxer(outputFile: File, private val sources: List<WebMParser>) {
+class WebmMuxer(outputFile: File, private val sources: List<WebMParser>,val progress: (Samples: String, percent: Int) -> Unit = { _, _ -> } ) {
      val output = RandomAccessFile(outputFile, "rw")
+    var totalBlocksFromAllSources=0
 
     init {
         writeEbmlHeader()
+        for (source in sources){
+            totalBlocksFromAllSources+=source.totalBlocks
+        }
     }
 
     private fun writeEbmlHeader() {
@@ -25,6 +29,7 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>) {
         var clusterSizePos = 0L
         var clusterTimecode = 0L
         var lastCueTime = -1L
+        var blocksProcessed = 0  // ✅ Track progress
 
         var videoBlock = sources[0].getBlock()
         var audioBlock = sources[1].getBlock()
@@ -41,6 +46,7 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>) {
 
         while (videoBlock != null || audioBlock != null) {
 
+            // Start new cluster on video keyframe
             if (videoBlock != null && videoBlock.isKeyframe) {
                 patchClusterSize()
 
@@ -53,7 +59,7 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>) {
                 clusterTimecode = videoBlock.absoluteTimecode
                 output.write(writeElement(0xE7, encodeTimecode(clusterTimecode.toInt())))
 
-                // Add cue (relative to segment start!)
+                // Add cue if new timecode
                 if (clusterTimecode != lastCueTime) {
                     listOfCues.add(
                         CueEntry(
@@ -65,6 +71,7 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>) {
                     lastCueTime = clusterTimecode
                 }
 
+                // Write blocks in cluster
                 while (true) {
                     val nextBlock = when {
                         videoBlock != null && audioBlock != null ->
@@ -78,13 +85,22 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>) {
                     val track = if (nextBlock == videoBlock) 1 else 2
                     writeSimpleBlock(nextBlock, track, relTime)
 
+                    // ✅ Increment processed blocks and report progress
+                    blocksProcessed++
+                    progress(
+                        "Merging - $blocksProcessed/$totalBlocksFromAllSources Samples",
+                        (blocksProcessed * 100 / totalBlocksFromAllSources).toInt()
+                    )
+
                     if (nextBlock == videoBlock) videoBlock = sources[0].getBlock()
                     else audioBlock = sources[1].getBlock()
 
+                    // Break on next video keyframe
                     if (videoBlock != null && videoBlock.isKeyframe && nextBlock != videoBlock) break
                 }
 
             } else {
+                // Write blocks if not starting a new cluster
                 val nextBlock = when {
                     videoBlock != null && audioBlock != null ->
                         if (videoBlock.absoluteTimecode <= audioBlock.absoluteTimecode) videoBlock else audioBlock
@@ -97,6 +113,13 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>) {
                 val track = if (nextBlock == videoBlock) 1 else 2
                 writeSimpleBlock(nextBlock, track, relTime)
 
+                // ✅ Increment processed blocks and report progress
+                blocksProcessed++
+                progress(
+                    "Merging - $blocksProcessed/$totalBlocksFromAllSources Samples",
+                    (blocksProcessed * 100 / totalBlocksFromAllSources).toInt()
+                )
+
                 if (nextBlock == videoBlock) videoBlock = sources[0].getBlock()
                 else audioBlock = sources[1].getBlock()
             }
@@ -105,6 +128,7 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>) {
         patchClusterSize()
         return listOfCues
     }
+
 
 
 
@@ -138,11 +162,6 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>) {
         output.seek(segmentSizePos)
         output.write(encodeVInt8(segmentSize, 8))
         output.seek(segmentEnd)
-
-        // Debug
-        for (cue in cueEntries) {
-            println("Cue time code: ${cue.cueTime}  Cue Offset: ${cue.cueClusterPosition}")
-        }
     }
 
 

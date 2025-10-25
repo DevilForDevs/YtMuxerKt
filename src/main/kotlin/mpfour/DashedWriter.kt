@@ -20,11 +20,6 @@ class DashedWriter(file: File, val sources: List<DashedParser>, val progress: (S
         output.write(ftyp)
 
         //reserve space or write flase data for moov box and its header size and type
-
-        /*val moovStart = output.filePointer
-        putInt(totalSize)
-        put("moov".toByteArray())*/
-
         val ts = sources.sumOf { it.totalSamplesFromMoof }
         val estimatedMoovSize= estimateMoovSize(ts)
         val moovReserveSize = estimatedMoovSize
@@ -146,7 +141,7 @@ class DashedWriter(file: File, val sources: List<DashedParser>, val progress: (S
 
     }
 
-    fun writeMdat() {
+    private fun writeMdat() {
         val mdatStart = output.filePointer
 
         // Write placeholder for size + "mdat"
