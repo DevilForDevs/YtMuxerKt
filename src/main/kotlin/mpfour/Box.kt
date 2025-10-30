@@ -1,6 +1,6 @@
 package mpfour
-data class Box(
-    var type: String = "",
-    var offset: Long = 0,
-    var size: Long = 0
+// Base class for common box metadata
+open class BoxInfo(
+    val offset: Long,   // absolute file offset (start of box)
+    val size: Long
 )

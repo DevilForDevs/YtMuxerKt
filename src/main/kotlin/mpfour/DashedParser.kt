@@ -1,6 +1,8 @@
 package mpfour
 import org.ytmuxer.webm.convertBytes
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -337,19 +339,122 @@ class DashedParser(file: File,val doLogging: Boolean){
         }
     }
     fun getSamples(initialChunk: Boolean) {
-        val firstFrameOffset=firstMoofPayloadOffset + firstMoofPayloadSize + 8
-        val lastInfo = LastSampleEntryInfo(
-            parsedHeader = false,
-            version = -1,
-            flags = -1
+        val mdatPayloadOffset = firstMoofPayloadOffset + firstMoofPayloadSize + 8
+
+        val trafBoxes = parseTraf(reader, firstMoofPayloadOffset, firstMoofPayloadSize)
+        if (trafBoxes.isEmpty()) {
+            println("No traf boxes found")
+            return
+        }
+
+        val trun = trafBoxes[0].truns.firstOrNull()
+        if (trun == null) {
+            println("No trun found")
+            return
+        }
+
+        println("Sample count = ${trun.sampleCount}")
+
+        // Seek to trun.entriesOffset to read sample table
+        reader.seek(trun.entriesOffset)
+
+        val hasDuration = trun.flags and 0x000100 != 0
+        val hasSize = trun.flags and 0x000200 != 0
+        val hasFlags = trun.flags and 0x000400 != 0
+        val hasCTO = trun.flags and 0x000800 != 0
+
+        // Read the first sample entry
+        var sampleSize = 0
+        if (hasDuration) reader.readInt() // skip duration
+        if (hasSize) sampleSize = reader.readInt()
+        if (hasFlags) reader.readInt() // skip flags
+        if (hasCTO) reader.readInt() // skip CTO
+
+        println("First sample size = $sampleSize bytes")
+
+        // Read full frame from mdat
+        reader.seek(mdatPayloadOffset)
+        val sampleData = ByteArray(sampleSize)
+        reader.readFully(sampleData)
+
+        println("Read first frame (${sampleData.size} bytes)")
+
+        // Save .h264 file (auto uses stsdBox)
+        val h264File = saveH264Frame(
+            sampleData,
+            outputDir = File("frames"),
+            fileName = "frame.h264",
+            stsdBox = stsdBox!!
         )
+        println("Saved H.264 frame: ${h264File.absolutePath}")
 
-        parseTraf(
-            reader, firstMoofPayloadOffset, firstMoofPayloadSize,lastInfo
-        )
+        // Optional: call FFmpeg (if available on system path)
+        try {
+            val outputImage = File("keyframe.jpg")
+            val process = ProcessBuilder(
+                "ffmpeg",
+                "-y",
+                "-i", h264File.absolutePath,
+                "-frames:v", "1",
+                outputImage.absolutePath
+            ).inheritIO().start()
+            process.waitFor()
 
-
+            if (outputImage.exists()) {
+                println("✅ Extracted keyframe image: ${outputImage.absolutePath}")
+            } else {
+                println("⚠️ FFmpeg did not produce an image. Check SPS/PPS or FFmpeg output.")
+            }
+        } catch (e: Exception) {
+            println("⚠️ FFmpeg not found or failed to execute: ${e.message}")
+        }
     }
+
+    /*fun saveH264Frame(
+        frame: ByteArray,
+        outputDir: File = File(System.getProperty("java.io.tmpdir")),
+        fileName: String = "frame.h264",
+        sps: ByteArray? = null,
+        pps: ByteArray? = null
+    ): File {
+        val (resolvedSps, resolvedPps) = when {
+            sps != null && pps != null -> Pair(sps, pps)
+            stsdBox != null -> extractSpsPpsFromStsd(stsdBox!!) ?: error("Failed to parse SPS/PPS from stsdBox")
+            else -> error("No SPS/PPS data available")
+        }
+
+        // convert length-prefixed NALs to start code prefixed
+        fun convertToAnnexB(data: ByteArray): ByteArray {
+            val out = ByteArrayOutputStream()
+            val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
+            while (buf.remaining() > 4) {
+                val len = buf.int
+                if (len <= 0 || len > buf.remaining()) break
+                out.write(byteArrayOf(0x00, 0x00, 0x00, 0x01))
+                val nal = ByteArray(len)
+                buf.get(nal)
+                out.write(nal)
+            }
+            return out.toByteArray()
+        }
+
+        val convertedFrame = convertToAnnexB(frame)
+
+        if (!outputDir.exists()) outputDir.mkdirs()
+        val outputFile = File(outputDir, fileName)
+
+        FileOutputStream(outputFile).use { fos ->
+            fos.write(byteArrayOf(0x00, 0x00, 0x00, 0x01))
+            fos.write(resolvedSps)
+            fos.write(byteArrayOf(0x00, 0x00, 0x00, 0x01))
+            fos.write(resolvedPps)
+            fos.write(convertedFrame)
+        }
+
+        return outputFile
+    }*/
+
+
 
 
 

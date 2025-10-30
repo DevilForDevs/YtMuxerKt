@@ -1,34 +1,61 @@
 package mpfour
 
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
 import java.io.RandomAccessFile
-import java.io.Reader
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 
-/*offset: Long,
-    size: Long,
-    requiredEntries: Int,
-    lastEntryCtoEndOffset: Long,
-    firstSampleOffset: Long // Absolute offset where mdat payload starts*/
+data class TfhdBox(
+    val version: Int,
+    val flags: Int,
+    val trackId: Long,
 
-data class TrunParsedResult(
-    val samples: List<TrunSampleEntry>,
-    val lastEntryCtoEndOffset: Long,
-    val totalSampleCount: Int
+    val baseDataOffset: Long? = null,
+    val sampleDescriptionIndex: Int? = null,
+    val defaultSampleDuration: Int? = null,
+    val defaultSampleSize: Int? = null,
+    val defaultSampleFlags: Int? = null,
+
+    val boxOffset: Long,
+    val boxSize: Long
+) : BoxInfo(boxOffset, boxSize)
+
+data class TrunBox(
+    val version: Int,
+    val flags: Int,
+    val sampleCount: Int,
+
+    val dataOffset: Int? = null,
+    val firstSampleFlags: Int? = null,
+
+    // Instead of storing all samples, store offsets & size to read on demand
+    val entriesOffset: Long,  // where entries start (after header)
+    val entriesSize: Long,    // total size of entries section
+
+    val boxOffset: Long,
+    val boxSize: Long,
+) : BoxInfo(boxOffset, boxSize)
+
+
+data class TfdtBox(
+    val version: Int,
+    val flags: Int,
+    val baseMediaDecodeTime: Long,
+
+    val boxOffset: Long,
+    val boxSize: Long,
+) : BoxInfo(boxOffset, boxSize)
+
+data class TrafBox(
+    val offset: Long,
+    val size: Long,
+    val tfhd: TfhdBox?,
+    val tfdt: TfdtBox?,
+    val truns: List<TrunBox>
 )
-
-data class LastSampleEntryInfo(
-   var parsedHeader: Boolean,
-    var version:Int,
-    var flags:Int,
-
-)
-
-
-
-
-
 
 
 class utils {
@@ -306,7 +333,9 @@ fun estimateMoovSize(sampleCount: Int): Int {
 
 
 
-fun parseTraf(reader: RandomAccessFile, moofOffset: Long, moofSize: Long,lastRetivedSampleInfo: LastSampleEntryInfo) {
+fun parseTraf(reader: RandomAccessFile, moofOffset: Long, moofSize: Long): List<TrafBox> {
+    val trafBoxes = mutableListOf<TrafBox>()
+
     var innerOffset = moofOffset
     val moofEnd = moofOffset + moofSize
 
@@ -315,117 +344,310 @@ fun parseTraf(reader: RandomAccessFile, moofOffset: Long, moofSize: Long,lastRet
         val header = ByteArray(8)
         reader.readFully(header)
 
-        val size = ByteBuffer.wrap(header, 0, 4).order(ByteOrder.BIG_ENDIAN).int.toLong()
+        val size = ByteBuffer.wrap(header, 0, 4)
+            .order(ByteOrder.BIG_ENDIAN)
+            .int.toLong()
+
         val type = String(header, 4, 4, Charsets.US_ASCII)
+
+        // Sanity check: avoid infinite loop on invalid boxes
+        if (size <= 0 || innerOffset + size > moofEnd) break
 
         when (type) {
             "traf" -> {
                 println("Found traf at offset=$innerOffset size=$size")
-                parseTrafBoxes(reader, innerOffset + 8, size - 8,lastRetivedSampleInfo)
+
+                val traf = parseTrafBoxes(reader, innerOffset + 8, size - 8)
+                trafBoxes.add(traf)
+            }
+
+            else -> {
+                // Skip unknown boxes inside moof
             }
         }
 
-        if (size <= 0) break
         innerOffset += size
     }
+
+    return trafBoxes
 }
 
-fun parseTrafBoxes(reader: RandomAccessFile, trafOffset: Long, trafSize: Long,lastRetivedSampleInfo: LastSampleEntryInfo) {
+fun parseTrafBoxes(reader: RandomAccessFile, trafOffset: Long, trafSize: Long): TrafBox {
     var innerOffset = trafOffset
     val trafEnd = trafOffset + trafSize
+
+    var tfhdBox: TfhdBox? = null
+    var tfdtBox: TfdtBox? = null
+    val trunBoxes = mutableListOf<TrunBox>()
 
     while (innerOffset + 8 <= trafEnd) {
         reader.seek(innerOffset)
         val header = ByteArray(8)
         reader.readFully(header)
 
-        val size = ByteBuffer.wrap(header, 0, 4).order(ByteOrder.BIG_ENDIAN).int.toLong()
+        val size = ByteBuffer.wrap(header, 0, 4)
+            .order(ByteOrder.BIG_ENDIAN)
+            .int.toLong()
         val type = String(header, 4, 4, Charsets.US_ASCII)
 
+        // safety: if size=0 or invalid, stop
+        if (size <= 0 || innerOffset + size > trafEnd) break
+
         when (type) {
-            "tfhd" -> parseTfhd(reader, innerOffset + 8, size - 8)
-            "tfdt" -> parseTfdt(reader, innerOffset + 8, size - 8)
-            "trun" -> parseTrun(reader = reader,innerOffset + 8)
+            "tfhd" -> {
+                tfhdBox = parseTfhd(reader, innerOffset + 8, size - 8)
+            }
+            "tfdt" -> {
+                tfdtBox = parseTfdt(reader, innerOffset + 8, size - 8)
+            }
+            "trun" -> {
+                val trun = parseTrun(reader, innerOffset + 8, size - 8)
+                trunBoxes.add(trun)
+            }
+            else -> {
+                // Unhandled sub-box; skip it
+            }
         }
 
-        if (size <= 0) break
         innerOffset += size
     }
+
+    return TrafBox(
+        offset = trafOffset - 8, // include box header
+        size = trafSize + 8,
+        tfhd = tfhdBox,
+        tfdt = tfdtBox,
+        truns = trunBoxes
+    )
 }
 
-/*reader, innerOffset + 8, size - 8,-1,3,firstSampleOffset*/
+fun RandomAccessFile.readUInt32(): Long =
+    readInt().toLong() and 0xFFFFFFFFL
 
-fun parseTfhd(reader: RandomAccessFile, offset: Long, size: Long) {
+fun RandomAccessFile.readUInt8(): Int =
+    readUnsignedByte()
+
+
+fun parseTfhd(reader: RandomAccessFile, offset: Long, size: Long): TfhdBox {
     reader.seek(offset)
-    val data = ByteArray(size.toInt())
-    reader.readFully(data)
-    println("Parsed tfhd (${size} bytes)")
+
+    val version = reader.readUInt8()
+    val flags = (reader.readUInt8() shl 16) or
+            (reader.readUInt8() shl 8) or
+            reader.readUInt8()
+
+    val trackId = reader.readUInt32()
+
+    var baseDataOffset: Long? = null
+    var sampleDescriptionIndex: Int? = null
+    var defaultSampleDuration: Int? = null
+    var defaultSampleSize: Int? = null
+    var defaultSampleFlags: Int? = null
+
+    if (flags and 0x000001 != 0) baseDataOffset = reader.readLong()
+    if (flags and 0x000002 != 0) sampleDescriptionIndex = reader.readInt()
+    if (flags and 0x000008 != 0) defaultSampleDuration = reader.readInt()
+    if (flags and 0x000010 != 0) defaultSampleSize = reader.readInt()
+    if (flags and 0x000020 != 0) defaultSampleFlags = reader.readInt()
+
+    return TfhdBox(
+        version, flags, trackId,
+        baseDataOffset, sampleDescriptionIndex,
+        defaultSampleDuration, defaultSampleSize, defaultSampleFlags,
+        boxOffset = offset - 8, // include header
+        boxSize = size + 8
+    )
 }
 
-fun parseTfdt(reader: RandomAccessFile, offset: Long, size: Long) {
+
+fun parseTfdt(reader: RandomAccessFile, offset: Long, size: Long): TfdtBox {
     reader.seek(offset)
-    val data = ByteArray(size.toInt())
-    reader.readFully(data)
-    println("Parsed tfdt (${size} bytes)")
+
+    val version = reader.readUInt8()
+    val flags = (reader.readUInt8() shl 16) or
+            (reader.readUInt8() shl 8) or
+            reader.readUInt8()
+
+    val baseMediaDecodeTime =
+        if (version == 1) reader.readLong()
+        else reader.readUInt32()
+
+    return TfdtBox(
+        version, flags, baseMediaDecodeTime,
+        boxOffset = offset - 8,
+        boxSize = size + 8
+    )
 }
 
-
-
-fun parseTrun(
-    reader: RandomAccessFile,
-    offset: Long
-) {
+fun parseTrun(reader: RandomAccessFile, offset: Long, size: Long): TrunBox {
     reader.seek(offset)
 
-    val version = reader.readUnsignedByte()
-    val flags = (reader.readUnsignedByte() shl 16) or
-            (reader.readUnsignedByte() shl 8) or
-            reader.readUnsignedByte()
+    val version = reader.readUInt8()
+    val flags = (reader.readUInt8() shl 16) or
+            (reader.readUInt8() shl 8) or
+            reader.readUInt8()
 
     val sampleCount = reader.readInt()
-
-    println("trun: version=$version flags=${flags.toString(16)} sampleCount=$sampleCount")
 
     var dataOffset: Int? = null
     var firstSampleFlags: Int? = null
 
-    if (flags and 0x000001 != 0) { // data-offset-present
-        dataOffset = reader.readInt()
-        println("  dataOffset=$dataOffset")
-    }
+    // Flags define optional fields
+    if (flags and 0x000001 != 0) dataOffset = reader.readInt()
+    if (flags and 0x000004 != 0) firstSampleFlags = reader.readInt()
 
-    if (flags and 0x000004 != 0) { // first-sample-flags-present
-        firstSampleFlags = reader.readInt()
-        println("  firstSampleFlags=0x${firstSampleFlags.toString(16)}")
-    }
+    val entriesStart = reader.filePointer
+    val entriesLength = size - (entriesStart - offset)
 
-    val hasSampleDuration = (flags and 0x000100) != 0
-    val hasSampleSize = (flags and 0x000200) != 0
-    val hasSampleFlags = (flags and 0x000400) != 0
-    val hasSampleCompositionTimeOffset = (flags and 0x000800) != 0
+    // We don't parse all sample entries here (to save memory)
+    // You can later seek to entriesOffset to read samples as needed
 
-    println("  hasDuration=$hasSampleDuration hasSize=$hasSampleSize hasFlags=$hasSampleFlags hasCTO=$hasSampleCompositionTimeOffset")
+    return TrunBox(
+        version, flags, sampleCount,
+        dataOffset, firstSampleFlags,
+        entriesOffset = entriesStart,
+        entriesSize = entriesLength,
+        boxOffset = offset - 8,
+        boxSize = size + 8,
+    )
+}
 
-    for (i in 0 until sampleCount) {
-        val entry = mutableListOf<String>()
-        if (hasSampleDuration) {
-            entry += "duration=${reader.readInt()}"
+fun extractSpsPpsFromStsd(stsdBox: ByteArray): Pair<ByteArray, ByteArray>? {
+    val buf = ByteBuffer.wrap(stsdBox).order(ByteOrder.BIG_ENDIAN)
+
+    // Skip FullBox header (version + flags) = 4 bytes
+    // Then skip entry_count = 4 bytes
+    if (buf.remaining() < 8) return null
+    buf.position(16)
+
+    while (buf.remaining() >= 8) {
+        val boxStart = buf.position()
+        val size = buf.int
+        val typeBytes = ByteArray(4)
+        buf.get(typeBytes)
+        val type = String(typeBytes, Charsets.US_ASCII)
+
+        if (size < 8 || boxStart + size > buf.limit()) {
+            println("⚠ Invalid box in stsd: type=$type size=$size — stopping")
+            break
         }
-        if (hasSampleSize) {
-            entry += "size=${reader.readInt()}"
-        }
-        if (hasSampleFlags) {
-            entry += "flags=0x${reader.readInt().toString(16)}"
-        }
-        if (hasSampleCompositionTimeOffset) {
-            if (version == 0) {
-                entry += "cto=${reader.readInt()}"
-            } else {
-                entry += "cto=${reader.readInt()}" // could be signed in version 1
+
+        println("Found in stsd → type=$type, size=$size")
+
+        if (type == "avc1" || type == "encv") {
+            // Jump into avc1 content
+            val innerOffset = boxStart + 8 + 78 // skip fixed video sample entry header
+            val remaining = size - 8 - 78
+            if (remaining <= 0 || innerOffset + remaining > buf.limit()) {
+                println("⚠ avc1 inner box out of range")
+                break
             }
+
+            val sub = ByteArray(remaining)
+            val oldPos = buf.position()
+            buf.position(innerOffset)
+            buf.get(sub)
+            buf.position(oldPos)
+
+            return extractSpsPpsFromAvc1(sub)
         }
-        println("  sample[$i]: ${entry.joinToString(", ")}")
+
+        buf.position(boxStart + size)
     }
+
+    return null
+}
+
+private fun extractSpsPpsFromAvc1(avc1Data: ByteArray): Pair<ByteArray, ByteArray>? {
+    val buf = ByteBuffer.wrap(avc1Data).order(ByteOrder.BIG_ENDIAN)
+
+    while (buf.remaining() >= 8) {
+        val start = buf.position()
+        val size = buf.int
+        val typeBytes = ByteArray(4)
+        buf.get(typeBytes)
+        val type = String(typeBytes, Charsets.US_ASCII)
+
+        if (size < 8 || start + size > buf.limit()) {
+            println("⚠ Invalid sub-box in avc1: type=$type size=$size — stopping")
+            break
+        }
+
+        println("Found in avc1 → $type (size=$size)")
+
+        if (type == "avcC") {
+            val avcCData = ByteArray(size - 8)
+            buf.get(avcCData)
+            return parseAvcC(avcCData)
+        } else {
+            buf.position(start + size)
+        }
+    }
+
+    return null
+}
+
+private fun parseAvcC(avcCData: ByteArray): Pair<ByteArray, ByteArray>? {
+    val avcBuf = ByteBuffer.wrap(avcCData).order(ByteOrder.BIG_ENDIAN)
+    if (avcBuf.remaining() < 6) return null
+
+    avcBuf.position(5) // skip version + profile + level + lengthSizeMinusOne
+
+    val numOfSPS = avcBuf.get().toInt() and 0x1F
+    if (numOfSPS < 1) return null
+
+    val spsLength = avcBuf.short.toInt() and 0xFFFF
+    val sps = ByteArray(spsLength)
+    avcBuf.get(sps)
+
+    val numOfPPS = avcBuf.get().toInt() and 0xFF
+    if (numOfPPS < 1) return Pair(sps, ByteArray(0))
+
+    val ppsLength = avcBuf.short.toInt() and 0xFFFF
+    val pps = ByteArray(ppsLength)
+    avcBuf.get(pps)
+
+    println("✅ Parsed avcC → SPS=${sps.size} bytes, PPS=${pps.size} bytes")
+    return Pair(sps, pps)
+}
+
+fun saveH264Frame(
+    frame: ByteArray,
+    outputDir: File = File(System.getProperty("java.io.tmpdir")),
+    fileName: String = "frame.h264",
+    stsdBox: ByteArray
+): File {
+    val (resolvedSps, resolvedPps) = extractSpsPpsFromStsd(stsdBox) ?: error("Failed to parse SPS/PPS from stsdBox")
+
+    // convert length-prefixed NALs to start code prefixed
+    fun convertToAnnexB(data: ByteArray): ByteArray {
+        val out = ByteArrayOutputStream()
+        val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
+        while (buf.remaining() > 4) {
+            val len = buf.int
+            if (len <= 0 || len > buf.remaining()) break
+            out.write(byteArrayOf(0x00, 0x00, 0x00, 0x01))
+            val nal = ByteArray(len)
+            buf.get(nal)
+            out.write(nal)
+        }
+        return out.toByteArray()
+    }
+
+    val convertedFrame = convertToAnnexB(frame)
+
+    if (!outputDir.exists()) outputDir.mkdirs()
+    val outputFile = File(outputDir, fileName)
+
+    FileOutputStream(outputFile).use { fos ->
+        fos.write(byteArrayOf(0x00, 0x00, 0x00, 0x01))
+        fos.write(resolvedSps)
+        fos.write(byteArrayOf(0x00, 0x00, 0x00, 0x01))
+        fos.write(resolvedPps)
+        fos.write(convertedFrame)
+    }
+
+    return outputFile
 }
 
 
@@ -435,27 +657,6 @@ fun parseTrun(
 
 
 
-
-
-/* #0 size=59217 flags=0 cto=512
-1008
-  #1 size=2706 flags=10000 cto=1536
-1020
-  #2 size=546 flags=10000 cto=0
-1032*/
-
-/*for (i in 0 until sampleCount) {
-        val parts = mutableListOf<String>()
-        if (hasDuration) parts += "duration=${reader.readInt()}"
-        if (hasSize) parts += "size=${reader.readInt()}"
-        if (hasFlags) parts += "flags=${reader.readInt().toUInt().toString(16)}"
-        if (hasCTO) parts += "cto=${reader.readInt()}"
-        if (i==10){
-
-            break
-        }
-        println("  #$i ${parts.joinToString(" ")}")
-    }*/
 
 
 
