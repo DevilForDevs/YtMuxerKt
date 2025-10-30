@@ -1,4 +1,4 @@
-package org.ytmuxer.mpfour
+package mpfour
 data class Box(
     var type: String = "",
     var offset: Long = 0,

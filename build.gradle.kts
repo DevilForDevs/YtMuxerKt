@@ -3,19 +3,22 @@ plugins {
 }
 
 group = "org.ytmuxer"
-version = "1.0-SNAPSHOT"
+version = "1.0"
 
 repositories {
     mavenCentral()
 }
 
 dependencies {
-    testImplementation(kotlin("test"))
+    implementation(kotlin("stdlib"))
 }
 
-tasks.test {
-    useJUnitPlatform()
+tasks.register<Jar>("exportJar") {
+    from(sourceSets.main.get().output)
+    archiveBaseName.set("YtMuxer")
+    destinationDirectory.set(layout.buildDirectory.dir("exports"))
 }
+
 kotlin {
     jvmToolchain(11)
 }

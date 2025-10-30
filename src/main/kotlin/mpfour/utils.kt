@@ -1,5 +1,6 @@
-package org.ytmuxer.mpfour
+package mpfour
 
+import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -253,15 +254,18 @@ class utils {
         }.array()
     }
     fun writeFtyp(): ByteArray {
-        return ByteBuffer.allocate(28).apply {
-            putInt(28)                     // size
-            put("ftyp".toByteArray())     // type
-            put("isom".toByteArray())     // major_brand
-            putInt(0x200)                 // minor_version
-            put("isom".toByteArray())     // compatible_brand
-            put("iso2".toByteArray())     // compatible_brand
+        val brands = arrayOf("isom", "iso2", "mp41", "mp42")
+        val size = 8 + 4 + 4 + brands.size * 4  // header + major_brand + minor_version + compatible brands
+
+        return ByteBuffer.allocate(size).apply {
+            putInt(size)                         // size
+            put("ftyp".toByteArray())            // type
+            put("isom".toByteArray())            // major_brand
+            putInt(0x200)                        // minor_version
+            brands.forEach { put(it.toByteArray()) }  // compatible brands
         }.array()
     }
+
 
 }
 fun estimateMoovSize(sampleCount: Int): Int {
@@ -272,3 +276,218 @@ fun estimateMoovSize(sampleCount: Int): Int {
     // Round up to nearest 4KB
     return ((estimatedSize + 4095) / 4096) * 4096
 }
+
+
+
+fun parseTraf(reader: RandomAccessFile, moofOffset: Long, moofSize: Long,firstSampleOffset: Long) {
+    var innerOffset = moofOffset
+    val moofEnd = moofOffset + moofSize
+
+    while (innerOffset + 8 <= moofEnd) {
+        reader.seek(innerOffset)
+        val header = ByteArray(8)
+        reader.readFully(header)
+
+        val size = ByteBuffer.wrap(header, 0, 4).order(ByteOrder.BIG_ENDIAN).int.toLong()
+        val type = String(header, 4, 4, Charsets.US_ASCII)
+
+        when (type) {
+            "traf" -> {
+                println("Found traf at offset=$innerOffset size=$size")
+                parseTrafBoxes(reader, innerOffset + 8, size - 8,firstSampleOffset)
+            }
+        }
+
+        if (size <= 0) break
+        innerOffset += size
+    }
+}
+
+fun parseTrafBoxes(reader: RandomAccessFile, trafOffset: Long, trafSize: Long,firstSampleOffset: Long) {
+    var innerOffset = trafOffset
+    val trafEnd = trafOffset + trafSize
+
+    while (innerOffset + 8 <= trafEnd) {
+        reader.seek(innerOffset)
+        val header = ByteArray(8)
+        reader.readFully(header)
+
+        val size = ByteBuffer.wrap(header, 0, 4).order(ByteOrder.BIG_ENDIAN).int.toLong()
+        val type = String(header, 4, 4, Charsets.US_ASCII)
+
+        when (type) {
+            "tfhd" -> parseTfhd(reader, innerOffset + 8, size - 8)
+            "tfdt" -> parseTfdt(reader, innerOffset + 8, size - 8)
+            "trun" -> parseTrun(reader, innerOffset + 8, size - 8,-1,firstSampleOffset)
+        }
+
+        if (size <= 0) break
+        innerOffset += size
+    }
+}
+
+fun parseTfhd(reader: RandomAccessFile, offset: Long, size: Long) {
+    reader.seek(offset)
+    val data = ByteArray(size.toInt())
+    reader.readFully(data)
+    println("Parsed tfhd (${size} bytes)")
+}
+
+fun parseTfdt(reader: RandomAccessFile, offset: Long, size: Long) {
+    reader.seek(offset)
+    val data = ByteArray(size.toInt())
+    reader.readFully(data)
+    println("Parsed tfdt (${size} bytes)")
+}
+
+
+
+fun parseTrun(
+    reader: RandomAccessFile,
+    offset: Long,
+    size: Long,
+    lastEntryCtoEndOffset: Long,
+    firstSampleOffset: Long
+) {
+    reader.seek(offset)
+
+    val version = reader.readUnsignedByte()
+    val flags = (reader.readUnsignedByte() shl 16) or
+            (reader.readUnsignedByte() shl 8) or
+            reader.readUnsignedByte()
+    val sampleCount = reader.readInt()
+
+    var dataOffset: Int? = null
+    var firstSampleFlags: Int? = null
+    if (flags and 0x000001 != 0) dataOffset = reader.readInt()
+    if (flags and 0x000004 != 0) firstSampleFlags = reader.readInt()
+
+    val hasDuration = flags and 0x000100 != 0
+    val hasSize = flags and 0x000200 != 0
+    val hasFlags = flags and 0x000400 != 0
+    val hasCTO = flags and 0x000800 != 0
+
+    println("trun: version=$version flags=${flags.toString(16)} sampleCount=$sampleCount")
+
+    if (lastEntryCtoEndOffset != -1L) {
+        reader.seek(lastEntryCtoEndOffset)
+    }
+
+    // --- Read only the first sample entry ---
+    var firstSampleSize = -1
+    if (hasDuration) reader.readInt() // skip duration
+    if (hasSize) firstSampleSize = reader.readInt()
+    if (hasFlags) reader.readInt()
+    if (hasCTO) reader.readInt()
+
+    if (firstSampleSize <= 0) {
+        println("⚠️ Invalid or missing first sample size.")
+        return
+    }
+
+    println("First sample size: $firstSampleSize bytes")
+
+    // --- Read first 64 bytes of actual frame data from 'mdat' ---
+    reader.seek(firstSampleOffset)
+    val frameHeader = ByteArray(64)
+    reader.read(frameHeader, 0, 64)
+
+    println("First 64 bytes of frame:")
+    println(frameHeader.joinToString(" ") { "%02X".format(it) })
+
+    // --- Detect format and parse ---
+    val detectedFormat = detectFrameFormat(frameHeader)
+    println(detectedFormat)
+}
+
+
+
+
+// Helper function to detect Annex B vs AVCC
+fun detectFrameFormat(frameHeader: ByteArray): String {
+    val buf = ByteBuffer.wrap(frameHeader).order(ByteOrder.BIG_ENDIAN)
+
+    // 1️⃣ Annex B start-code check
+    if (frameHeader.startsWith(byteArrayOf(0x00, 0x00, 0x00, 0x01)) ||
+        frameHeader.startsWith(byteArrayOf(0x00, 0x00, 0x01))
+    ) {
+        val nalType = frameHeader.firstNalType()
+        val name = h264NalName(nalType)
+        return "✅ Detected Annex B (start-code prefixed), NAL type=$nalType ($name)"
+    }
+
+    // 2️⃣ AVCC / AVC1 length-prefixed check
+    if (frameHeader.size >= 5) {
+        val prefix = buf.int
+        if (prefix > 0 && prefix < 0x1000000) {      // any plausible length (<=16 MB)
+            val nalType = frameHeader[4].toInt() and 0x1F
+            val name = h264NalName(nalType)
+            return "✅ Detected AVCC (length-prefixed), first NAL size=$prefix, type=$nalType ($name)"
+        }
+    }
+
+    return "⚠️ Unknown frame format"
+}
+
+fun h264NalName(type: Int): String = when (type) {
+    1 -> "Non-IDR slice"
+    2 -> "Data partition A"
+    3 -> "Data partition B"
+    4 -> "Data partition C"
+    5 -> "IDR slice"
+    6 -> "SEI"
+    7 -> "SPS"
+    8 -> "PPS"
+    9 -> "AUD"
+    10 -> "End of sequence"
+    11 -> "End of stream"
+    else -> "Other"
+}
+
+
+// Helper extensions
+fun ByteArray.startsWith(prefix: ByteArray): Boolean {
+    if (this.size < prefix.size) return false
+    for (i in prefix.indices) {
+        if (this[i] != prefix[i]) return false
+    }
+    return true
+}
+
+// Extract NAL type (bits 1–5 of first byte after start code)
+fun ByteArray.firstNalType(): Int {
+    val start = when {
+        this.startsWith(byteArrayOf(0x00, 0x00, 0x00, 0x01)) -> 4
+        this.startsWith(byteArrayOf(0x00, 0x00, 0x01)) -> 3
+        else -> 0
+    }
+    return if (this.size > start) this[start].toInt() and 0x1F else -1
+}
+
+
+
+/* #0 size=59217 flags=0 cto=512
+1008
+  #1 size=2706 flags=10000 cto=1536
+1020
+  #2 size=546 flags=10000 cto=0
+1032*/
+
+/*for (i in 0 until sampleCount) {
+        val parts = mutableListOf<String>()
+        if (hasDuration) parts += "duration=${reader.readInt()}"
+        if (hasSize) parts += "size=${reader.readInt()}"
+        if (hasFlags) parts += "flags=${reader.readInt().toUInt().toString(16)}"
+        if (hasCTO) parts += "cto=${reader.readInt()}"
+        if (i==10){
+
+            break
+        }
+        println("  #$i ${parts.joinToString(" ")}")
+    }*/
+
+
+
+
+
+

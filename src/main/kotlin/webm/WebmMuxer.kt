@@ -85,12 +85,16 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>,val prog
                     val track = if (nextBlock == videoBlock) 1 else 2
                     writeSimpleBlock(nextBlock, track, relTime)
 
-                    // ✅ Increment processed blocks and report progress
+                    // ✅ Increment processed blocks
                     blocksProcessed++
-                    progress(
-                        "Merging - $blocksProcessed/$totalBlocksFromAllSources Samples",
-                        (blocksProcessed * 100 / totalBlocksFromAllSources).toInt()
-                    )
+
+                    // ✅ Filtered progress updates
+                    if (blocksProcessed % 2000 == 0 || nextBlock == videoBlock && videoBlock == null && audioBlock == null) {
+                        progress(
+                            "Merging - $blocksProcessed/$totalBlocksFromAllSources Samples",
+                            (blocksProcessed * 100 / totalBlocksFromAllSources).toInt()
+                        )
+                    }
 
                     if (nextBlock == videoBlock) videoBlock = sources[0].getBlock()
                     else audioBlock = sources[1].getBlock()
@@ -113,12 +117,16 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>,val prog
                 val track = if (nextBlock == videoBlock) 1 else 2
                 writeSimpleBlock(nextBlock, track, relTime)
 
-                // ✅ Increment processed blocks and report progress
+                // ✅ Increment processed blocks
                 blocksProcessed++
-                progress(
-                    "Merging - $blocksProcessed/$totalBlocksFromAllSources Samples",
-                    (blocksProcessed * 100 / totalBlocksFromAllSources).toInt()
-                )
+
+                // ✅ Filtered progress updates
+                if (blocksProcessed % 2000 == 0 || nextBlock == videoBlock && videoBlock == null && audioBlock == null) {
+                    progress(
+                        "Merging - $blocksProcessed/$totalBlocksFromAllSources Samples",
+                        (blocksProcessed * 100 / totalBlocksFromAllSources).toInt()
+                    )
+                }
 
                 if (nextBlock == videoBlock) videoBlock = sources[0].getBlock()
                 else audioBlock = sources[1].getBlock()
@@ -128,6 +136,7 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>,val prog
         patchClusterSize()
         return listOfCues
     }
+
 
 
 
@@ -153,6 +162,8 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>,val prog
         val cuesPos = output.filePointer - segmentStart
         writeCues(cueEntries)
 
+
+
         // SeekHead (at end)
         writeSeekHead(segmentStart, infoPos, tracksPos, cuesPos)
 
@@ -163,6 +174,57 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>,val prog
         output.write(encodeVInt8(segmentSize, 8))
         output.seek(segmentEnd)
     }
+    fun writeStringElement(idHex: String, value: String) {
+        val id = hexToBytes(idHex)
+        val data = value.toByteArray(Charsets.UTF_8)
+        output.write(id)
+        output.write(encodeVInt(data.size.toLong()))
+        output.write(data)
+    }
+    fun calculateAttachedFileSize(fileData: ByteArray, fileName: String): Long {
+        // Each child element size: ID + size field + data length
+        val fileNameSize = fileName.toByteArray(Charsets.UTF_8).size
+        val mimeSize = "image/png".toByteArray(Charsets.UTF_8).size
+        val fileDataSize = fileData.size
+
+        // IDs: FileName (2 bytes), MimeType (2 bytes), FileData (2 bytes)
+        val total = 2 + 1 + fileNameSize +   // approximate VInt for size = 1 byte
+                2 + 1 + mimeSize +
+                2 + 1 + fileDataSize
+        return total.toLong()
+    }
+    fun calculatePayloadSize(fileData: ByteArray, fileName: String): Long {
+        return calculateAttachedFileSize(fileData, fileName)
+    }
+
+    fun writeBinaryElement(idHex: String, data: ByteArray) {
+        val id = hexToBytes(idHex)
+        output.write(id)
+        output.write(encodeVInt(data.size.toLong()))
+        output.write(data)
+    }
+
+    fun writeAttachments(poster: ByteArray, fileName: String = "poster.png") {
+        // Attachments element
+        output.write(hexToBytes("19 41 A4 69")) // Attachments ID
+
+        // calculate payload size: size of AttachedFile
+        val attachedFileSize = calculateAttachedFileSize(poster, fileName)
+        output.write(encodeVInt(attachedFileSize)) // VInt size
+
+        // AttachedFile element
+        output.write(hexToBytes("61 A7")) // AttachedFile ID
+        val attachedPayloadSize = calculatePayloadSize(poster, fileName)
+        output.write(encodeVInt(attachedPayloadSize))
+
+        // FileName
+        writeStringElement("46 6E", fileName) // FileName ID
+        // FileMimeType
+        writeStringElement("46 74", "image/png") // Mime type ID
+        // FileData
+        writeBinaryElement("46 5C", poster) // FileData ID
+    }
+
 
 
 

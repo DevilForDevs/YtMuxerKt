@@ -1,12 +1,13 @@
-package org.ytmuxer.mpfour
+package mpfour
 import org.ytmuxer.webm.convertBytes
+import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
-class DashedParser(val reader: RandomAccessFile,private val doLogging: Boolean,private val baseOffset: Long,private val baseEndOffset: Long){
 
-    var currentBox = Box()
+class DashedParser(file: File,val doLogging: Boolean){
+    val reader= RandomAccessFile(file,"r")
     var movieTimescale: Int = -1
     var movieDuration: Long = -1
     val ATOM_TKHD: Int = 0x746B6864
@@ -23,10 +24,11 @@ class DashedParser(val reader: RandomAccessFile,private val doLogging: Boolean,p
 
     var stsdBox: ByteArray? =null
 
-    val moofs = mutableListOf<Box>()
-    var currentMoofIndex=0;
-    var lastRetrivedSampleIndex=-1
-    val entries = mutableListOf<TrunSampleEntry>()
+
+    var firstMoofPayloadOffset=0L
+    var firstMoofPayloadSize=0L
+    var entriesToSkip_Offset=0L
+
 
     var totalSamplesFromMoof=0
 
@@ -46,42 +48,77 @@ class DashedParser(val reader: RandomAccessFile,private val doLogging: Boolean,p
 
 
     fun parse() {
-        reader.seek(baseOffset)
+        reader.seek(0)
 
-        while (reader.filePointer + 8 <= baseEndOffset) {
-            val startOffset = reader.filePointer
+        // --- Check ISO base media header (ftyp or styp) ---
+        if (reader.length() < 8) {
+            throw IllegalStateException("Invalid container: file too small to be a valid ISO file.")
+        }
 
-            val size = reader.readInt().toLong()
-            if (size < 8) throw IllegalStateException("Invalid box size $size at offset $startOffset")
+        val startOffset = reader.filePointer
+        val size = reader.readInt().toLong()
+        val typeBytes = ByteArray(4).also { reader.readFully(it) }
+        val boxType = String(typeBytes, Charsets.US_ASCII)
 
-            val typeBytes = ByteArray(4).also { reader.readFully(it) }
-            val boxType = String(typeBytes, Charsets.US_ASCII)
+        if (boxType != "ftyp" && boxType != "styp") {
+            throw IllegalStateException("Invalid container: expected 'ftyp' or 'styp' at offset 0, found '$boxType'")
+        }
 
-            if (doLogging) {
-                println("Box $boxType At: $startOffset  Size: ${convertBytes(size)}")
+        if (doLogging) {
+            println("Valid ISO header found: '$boxType' at offset $startOffset (size=$size)")
+        }
+
+        // --- Move back to start to re-read all boxes ---
+        reader.seek(0)
+
+        // --- Main parsing loop ---
+        while (reader.filePointer + 8 <= reader.length()) {
+            val startOffsetLoop = reader.filePointer
+
+            val sizeLoop = reader.readInt().toLong()
+            if (sizeLoop < 8) {
+                throw IllegalStateException("Invalid box size $sizeLoop at offset $startOffsetLoop")
             }
 
-            currentBox = Box(type = boxType, offset = startOffset, size = size)
+            val typeBytesLoop = ByteArray(4).also { reader.readFully(it) }
+            val boxTypeLoop = String(typeBytesLoop, Charsets.US_ASCII)
 
-            when (boxType) {
+            val payloadOffset = reader.filePointer
+            val payloadSize = sizeLoop - 8
+
+            if (doLogging) {
+                println(
+                    "Box: $boxTypeLoop | BoxOffset: $startOffsetLoop | BoxSize: $sizeLoop | " +
+                            "PayloadOffset: $payloadOffset | PayloadSize: ${convertBytes(payloadSize)}"
+                )
+            }
+
+            when (boxTypeLoop) {
                 "moov" -> {
-                    val payload = ByteArray((size - 8).toInt())
+                    val payload = ByteArray(payloadSize.toInt())
                     reader.readFully(payload)
-                    parseMoov(payload, doLogging)
+                    parseMoov(payload)
                 }
+
                 "moof" -> {
-                    moofs.add(Box(type = boxType, offset = startOffset, size = size))
-                    val payload = ByteArray((size - 8).toInt())
+                    if (firstMoofPayloadOffset==0L){
+                        firstMoofPayloadOffset=payloadOffset
+                        firstMoofPayloadSize=payloadSize
+                    }
+                    val payload = ByteArray(payloadSize.toInt())
                     reader.readFully(payload)
                     countSamplesInMoof(payload)
                 }
+
                 else -> {
-                    // skip other boxes
-                    reader.seek(startOffset + size)
+                    // Skip unknown or irrelevant boxes
+                    reader.seek(payloadOffset + payloadSize)
                 }
             }
         }
     }
+
+
 
 
     fun countSamplesInMoof(moofData: ByteArray): Int {
@@ -131,7 +168,7 @@ class DashedParser(val reader: RandomAccessFile,private val doLogging: Boolean,p
 
 
 
-    fun parseMoov(payload: ByteArray,doLogging: Boolean) {
+    fun parseMoov(payload: ByteArray) {
         val buffer = ByteBuffer.wrap(payload)
         while (buffer.remaining() >= 8) {
             val boxStart = buffer.position()
@@ -139,24 +176,14 @@ class DashedParser(val reader: RandomAccessFile,private val doLogging: Boolean,p
             val boxType = buffer.int
 
             when (boxType) {
-                0x6D766864 -> {
-                    if (doLogging){
-                        println("Box $boxType At: $boxStart  Size: ${convertBytes(boxSize.toLong())}")
-                    }
-                    parseMvhd(buffer.slice().limit(boxSize - 8) as ByteBuffer,doLogging)
-                } // "mvhd"
-                0x7472616B -> {
-                    if (doLogging){
-                        println("Box $boxType At: $boxStart  Size: ${convertBytes(boxSize.toLong())}")
-                    }
-                    parseTrak(buffer.slice().limit(boxSize - 8) as ByteBuffer)
-                } // "trak"
+                0x6D766864 -> parseMvhd(buffer.slice().limit(boxSize - 8) as ByteBuffer) // "mvhd"
+                0x7472616B -> parseTrak(buffer.slice().limit(boxSize - 8) as ByteBuffer) // "trak"
             }
             buffer.position(boxStart + boxSize)
         }
     }
 
-    fun parseMvhd(buffer: ByteBuffer,doLogging: Boolean) {
+    fun parseMvhd(buffer: ByteBuffer) {
 
         val version = buffer.get().toInt()
         buffer.get() // flags
@@ -167,19 +194,12 @@ class DashedParser(val reader: RandomAccessFile,private val doLogging: Boolean,p
             buffer.long // modification_time
             movieTimescale = buffer.int
             movieDuration = buffer.long
-            if (doLogging){
-                println("Box: Mvhd MovieTimescale: $movieTimescale  Movie Duration: $movieDuration")
-            }
-
 
         } else {
             buffer.int
             buffer.int
             movieTimescale = buffer.int
             movieDuration = buffer.int.toLong()
-            if (doLogging){
-                println("Box: Mvhd MovieTimescale: $movieTimescale  Movie Duration: $movieDuration")
-            }
         }
 
 
@@ -233,7 +253,7 @@ class DashedParser(val reader: RandomAccessFile,private val doLogging: Boolean,p
             data.position(data.limit())
         }
 
-       /* println("🎯 trackId=$trackId, duration=$trackDuration")*/
+        /* println("🎯 trackId=$trackId, duration=$trackDuration")*/
     }
 
     fun parseMdia(data: ByteBuffer) {
@@ -316,114 +336,37 @@ class DashedParser(val reader: RandomAccessFile,private val doLogging: Boolean,p
             data.position(boxStart + boxSize)
         }
     }
-    fun getSamples(initialChunk: Boolean): MutableList<TrunSampleEntry> {
-        entries.clear()
-        val targetSamples = if (initialChunk) 2 else 6
+    fun getSamples(initialChunk: Boolean) {
+        val firstFrameOffset=firstMoofPayloadOffset + firstMoofPayloadSize + 8
+        parseTraf(reader,firstMoofPayloadOffset,firstMoofPayloadSize,firstFrameOffset)
 
-        while (currentMoofIndex < moofs.size) {
-            val currentMoof = moofs[currentMoofIndex]
-            val moofEnd = currentMoof.offset + currentMoof.size
-            var moofPayloadStart = currentMoof.offset + 8
-
-            while (moofPayloadStart + 8 < moofEnd) {
-                reader.seek(moofPayloadStart)
-                val boxHeader = ByteArray(8)
-                reader.readFully(boxHeader)
-                val innerBoxSize = ByteBuffer.wrap(boxHeader, 0, 4).order(ByteOrder.BIG_ENDIAN).int.toLong()
-                val innerBoxType = String(boxHeader, 4, 4, Charsets.US_ASCII)
-
-                if (innerBoxType == "traf") {
-                    val trafStart = reader.filePointer
-                    val trafEnd = trafStart + (innerBoxSize - 8)
-
-                    while (reader.filePointer + 8 <= trafEnd) {
-                        val innerHeader = ByteArray(8)
-                        reader.readFully(innerHeader)
-
-                        val innerSize = ByteBuffer.wrap(innerHeader, 0, 4).order(ByteOrder.BIG_ENDIAN).int
-                        val innerType = String(innerHeader, 4, 4, Charsets.US_ASCII)
-
-                        if (innerType == "trun") {
-                            val versionAndFlags = ByteArray(4)
-                            reader.readFully(versionAndFlags)
-                            val version = versionAndFlags[0].toInt() and 0xFF
-                            val flags = ((versionAndFlags[1].toInt() and 0xFF) shl 16) or
-                                    ((versionAndFlags[2].toInt() and 0xFF) shl 8) or
-                                    (versionAndFlags[3].toInt() and 0xFF)
-
-                            val sampleCount = reader.readInt()
-
-                            val dataOffset = if ((flags and 0x000001) != 0) reader.readInt() else 0
-
-                            // Optional fields presence
-                            val hasDuration = (flags and 0x000100) != 0
-                            val hasSize = (flags and 0x000200) != 0
-                            val hasFlags = (flags and 0x000400) != 0
-                            val hasCto = (flags and 0x000800) != 0
-
-                            // Fallback defaults if tfhd not parsed yet (replace with actual tfhd values if available)
-                            val defaultDuration = 1024
-                            val defaultSize = 0
-                            val defaultFlags = 0
-
-                            val startIndex = lastRetrivedSampleIndex + 1
-                            val sampleOffsetStart = currentMoof.offset + dataOffset
-                            var sampleOffset = sampleOffsetStart
-
-                            for (i in 0 until sampleCount) {
-                                val duration = if (hasDuration) reader.readInt() else defaultDuration
-                                val size = if (hasSize) reader.readInt() else defaultSize
-                                val flagsPerSample = if (hasFlags) reader.readInt() else defaultFlags
-                                val cto = if (hasCto) reader.readInt() else 0
-
-                                val isKeyframe = (flagsPerSample and 0x00010000) == 0
-
-                                if (i < startIndex) {
-                                    sampleOffset += size
-                                    continue
-                                }
-
-                                entries.add(
-                                    TrunSampleEntry(
-                                        index = i,
-                                        size = size,
-                                        offset = sampleOffset,
-                                        duration = duration,
-                                        flags = flagsPerSample,
-                                        compositionTimeOffset = cto,
-                                        isSyncSample = isKeyframe
-                                    )
-                                )
-
-                                sampleOffset += size
-                                lastRetrivedSampleIndex = i
-
-                                if (entries.size >= targetSamples) {
-                                    return entries
-                                }
-                            }
-
-                            // ✅ Finished reading this moof's samples
-                            currentMoofIndex++
-                            lastRetrivedSampleIndex = -1
-                        }
-
-
-                        reader.seek(reader.filePointer + (innerSize - 8))
-                    }
-                }
-
-                moofPayloadStart += innerBoxSize
-            }
-        }
-
-        return if (entries.size > targetSamples) {
-            entries.subList(0, targetSamples)
-        } else {
-            entries
-        }
 
     }
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 }
+
+/*moof
+ └── mfhd (Movie Fragment Header)
+ └── traf (Track Fragment)
+      ├── tfhd (Track Fragment Header)
+      ├── tfdt (Track Fragment Decode Time)
+      ├── trun (Track Run)  ← contains the actual sample info
+      └── (optional: sdtp, senc, subs, etc.)
+*/

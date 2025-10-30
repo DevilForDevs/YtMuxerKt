@@ -1,4 +1,4 @@
-package org.ytmuxer.mpfour
+package mpfour
 
 data class TrunSampleEntry(
     val index: Int,
