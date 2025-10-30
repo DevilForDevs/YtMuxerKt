@@ -1,8 +1,35 @@
 package mpfour
 
 import java.io.RandomAccessFile
+import java.io.Reader
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+
+
+/*offset: Long,
+    size: Long,
+    requiredEntries: Int,
+    lastEntryCtoEndOffset: Long,
+    firstSampleOffset: Long // Absolute offset where mdat payload starts*/
+
+data class TrunParsedResult(
+    val samples: List<TrunSampleEntry>,
+    val lastEntryCtoEndOffset: Long,
+    val totalSampleCount: Int
+)
+
+data class LastSampleEntryInfo(
+   var parsedHeader: Boolean,
+    var version:Int,
+    var flags:Int,
+
+)
+
+
+
+
+
+
 
 class utils {
     fun writeStbl(vararg boxes: ByteArray): ByteArray {
@@ -279,7 +306,7 @@ fun estimateMoovSize(sampleCount: Int): Int {
 
 
 
-fun parseTraf(reader: RandomAccessFile, moofOffset: Long, moofSize: Long,firstSampleOffset: Long) {
+fun parseTraf(reader: RandomAccessFile, moofOffset: Long, moofSize: Long,lastRetivedSampleInfo: LastSampleEntryInfo) {
     var innerOffset = moofOffset
     val moofEnd = moofOffset + moofSize
 
@@ -294,7 +321,7 @@ fun parseTraf(reader: RandomAccessFile, moofOffset: Long, moofSize: Long,firstSa
         when (type) {
             "traf" -> {
                 println("Found traf at offset=$innerOffset size=$size")
-                parseTrafBoxes(reader, innerOffset + 8, size - 8,firstSampleOffset)
+                parseTrafBoxes(reader, innerOffset + 8, size - 8,lastRetivedSampleInfo)
             }
         }
 
@@ -303,7 +330,7 @@ fun parseTraf(reader: RandomAccessFile, moofOffset: Long, moofSize: Long,firstSa
     }
 }
 
-fun parseTrafBoxes(reader: RandomAccessFile, trafOffset: Long, trafSize: Long,firstSampleOffset: Long) {
+fun parseTrafBoxes(reader: RandomAccessFile, trafOffset: Long, trafSize: Long,lastRetivedSampleInfo: LastSampleEntryInfo) {
     var innerOffset = trafOffset
     val trafEnd = trafOffset + trafSize
 
@@ -318,13 +345,15 @@ fun parseTrafBoxes(reader: RandomAccessFile, trafOffset: Long, trafSize: Long,fi
         when (type) {
             "tfhd" -> parseTfhd(reader, innerOffset + 8, size - 8)
             "tfdt" -> parseTfdt(reader, innerOffset + 8, size - 8)
-            "trun" -> parseTrun(reader, innerOffset + 8, size - 8,-1,firstSampleOffset)
+            "trun" -> parseTrun(reader = reader,innerOffset + 8)
         }
 
         if (size <= 0) break
         innerOffset += size
     }
 }
+
+/*reader, innerOffset + 8, size - 8,-1,3,firstSampleOffset*/
 
 fun parseTfhd(reader: RandomAccessFile, offset: Long, size: Long) {
     reader.seek(offset)
@@ -344,92 +373,66 @@ fun parseTfdt(reader: RandomAccessFile, offset: Long, size: Long) {
 
 fun parseTrun(
     reader: RandomAccessFile,
-    offset: Long,
-    size: Long,
-    lastEntryCtoEndOffset: Long,
-    firstSampleOffset: Long
+    offset: Long
 ) {
     reader.seek(offset)
+
     val version = reader.readUnsignedByte()
     val flags = (reader.readUnsignedByte() shl 16) or
             (reader.readUnsignedByte() shl 8) or
             reader.readUnsignedByte()
+
     val sampleCount = reader.readInt()
-
-    var dataOffset: Int? = null
-    var firstSampleFlags: Int? = null
-    if (flags and 0x000001 != 0) dataOffset = reader.readInt()
-    if (flags and 0x000004 != 0) firstSampleFlags = reader.readInt()
-
-    val hasDuration = flags and 0x000100 != 0
-    val hasSize = flags and 0x000200 != 0
-    val hasFlags = flags and 0x000400 != 0
-    val hasCTO = flags and 0x000800 != 0
 
     println("trun: version=$version flags=${flags.toString(16)} sampleCount=$sampleCount")
 
-    if (lastEntryCtoEndOffset != -1L) {
-        reader.seek(lastEntryCtoEndOffset)
+    var dataOffset: Int? = null
+    var firstSampleFlags: Int? = null
+
+    if (flags and 0x000001 != 0) { // data-offset-present
+        dataOffset = reader.readInt()
+        println("  dataOffset=$dataOffset")
     }
 
-    // --- Read first sample size ---
-    var firstSampleSize = -1
-    if (hasSize) {
-        firstSampleSize = reader.readInt()
-        println("First sample size: $firstSampleSize bytes")
-    } else {
-        println("⚠️ No sample size field in trun (cannot locate sample size)")
-        return
+    if (flags and 0x000004 != 0) { // first-sample-flags-present
+        firstSampleFlags = reader.readInt()
+        println("  firstSampleFlags=0x${firstSampleFlags.toString(16)}")
     }
 
-    // --- Read first 64 bytes of the frame ---
-    reader.seek(firstSampleOffset)
-    val first64 = ByteArray(64)
-    reader.readFully(first64)
-    println("First 64 bytes of frame:\n" + first64.joinToString(" ") { "%02X".format(it) })
+    val hasSampleDuration = (flags and 0x000100) != 0
+    val hasSampleSize = (flags and 0x000200) != 0
+    val hasSampleFlags = (flags and 0x000400) != 0
+    val hasSampleCompositionTimeOffset = (flags and 0x000800) != 0
 
-    // --- Detect AVCC (length-prefixed) or Annex-B (start code) ---
-    val first4 = ByteBuffer.wrap(first64, 0, 4).order(ByteOrder.BIG_ENDIAN).int
-    if (first4 in 1..1_000_000) {
-        val nalHeader = first64[4].toInt() and 0xFF
-        val nalType = nalHeader and 0x1F
-        println("✅ Detected AVCC (length-prefixed), first NAL size=$first4, type=$nalType (${h264NalName(nalType)})")
-        // Scan all NALs in this sample
-        scanNalUnits(reader, firstSampleOffset, firstSampleSize)
-    } else if (first4 == 0x00000001 || first4 == 0x00000100) {
-        val nalType = first64[4].toInt() and 0x1F
-        println("✅ Detected Annex-B (start code), NAL type=$nalType (${h264NalName(nalType)})")
-    } else {
-        println("⚠️ Unknown frame format")
-    }
-}
+    println("  hasDuration=$hasSampleDuration hasSize=$hasSampleSize hasFlags=$hasSampleFlags hasCTO=$hasSampleCompositionTimeOffset")
 
-// --- Helper: Scan all NAL units in a sample ---
-fun scanNalUnits(reader: RandomAccessFile, startOffset: Long, sampleSize: Int) {
-    println("\n🔍 Scanning NAL units:")
-    reader.seek(startOffset)
-    var offset = 0
-    while (offset + 4 < sampleSize) {
-        val len = reader.readInt()
-        if (len <= 0 || len > sampleSize - offset - 4) break
-        val nalHeader = reader.readUnsignedByte()
-        val nalType = nalHeader and 0x1F
-        println("  +$offset: type=$nalType (${h264NalName(nalType)}), length=$len")
-        reader.skipBytes(len - 1)
-        offset += 4 + len
+    for (i in 0 until sampleCount) {
+        val entry = mutableListOf<String>()
+        if (hasSampleDuration) {
+            entry += "duration=${reader.readInt()}"
+        }
+        if (hasSampleSize) {
+            entry += "size=${reader.readInt()}"
+        }
+        if (hasSampleFlags) {
+            entry += "flags=0x${reader.readInt().toString(16)}"
+        }
+        if (hasSampleCompositionTimeOffset) {
+            if (version == 0) {
+                entry += "cto=${reader.readInt()}"
+            } else {
+                entry += "cto=${reader.readInt()}" // could be signed in version 1
+            }
+        }
+        println("  sample[$i]: ${entry.joinToString(", ")}")
     }
 }
 
-// --- Helper: Convert NAL type to name ---
-fun h264NalName(type: Int): String = when (type) {
-    1 -> "Non-IDR Slice"
-    5 -> "IDR Slice"
-    6 -> "SEI"
-    7 -> "SPS"
-    8 -> "PPS"
-    9 -> "AUD"
-    else -> "Unknown"
-}
+
+
+
+
+
 
 
 

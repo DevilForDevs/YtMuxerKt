@@ -338,7 +338,15 @@ class DashedParser(file: File,val doLogging: Boolean){
     }
     fun getSamples(initialChunk: Boolean) {
         val firstFrameOffset=firstMoofPayloadOffset + firstMoofPayloadSize + 8
-        parseTraf(reader,firstMoofPayloadOffset,firstMoofPayloadSize,firstFrameOffset)
+        val lastInfo = LastSampleEntryInfo(
+            parsedHeader = false,
+            version = -1,
+            flags = -1
+        )
+
+        parseTraf(
+            reader, firstMoofPayloadOffset, firstMoofPayloadSize,lastInfo
+        )
 
 
     }
