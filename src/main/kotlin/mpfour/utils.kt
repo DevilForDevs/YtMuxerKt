@@ -350,7 +350,6 @@ fun parseTrun(
     firstSampleOffset: Long
 ) {
     reader.seek(offset)
-
     val version = reader.readUnsignedByte()
     val flags = (reader.readUnsignedByte() shl 16) or
             (reader.readUnsignedByte() shl 8) or
@@ -373,96 +372,65 @@ fun parseTrun(
         reader.seek(lastEntryCtoEndOffset)
     }
 
-    // --- Read only the first sample entry ---
+    // --- Read first sample size ---
     var firstSampleSize = -1
-    if (hasDuration) reader.readInt() // skip duration
-    if (hasSize) firstSampleSize = reader.readInt()
-    if (hasFlags) reader.readInt()
-    if (hasCTO) reader.readInt()
-
-    if (firstSampleSize <= 0) {
-        println("⚠️ Invalid or missing first sample size.")
+    if (hasSize) {
+        firstSampleSize = reader.readInt()
+        println("First sample size: $firstSampleSize bytes")
+    } else {
+        println("⚠️ No sample size field in trun (cannot locate sample size)")
         return
     }
 
-    println("First sample size: $firstSampleSize bytes")
-
-    // --- Read first 64 bytes of actual frame data from 'mdat' ---
+    // --- Read first 64 bytes of the frame ---
     reader.seek(firstSampleOffset)
-    val frameHeader = ByteArray(64)
-    reader.read(frameHeader, 0, 64)
+    val first64 = ByteArray(64)
+    reader.readFully(first64)
+    println("First 64 bytes of frame:\n" + first64.joinToString(" ") { "%02X".format(it) })
 
-    println("First 64 bytes of frame:")
-    println(frameHeader.joinToString(" ") { "%02X".format(it) })
-
-    // --- Detect format and parse ---
-    val detectedFormat = detectFrameFormat(frameHeader)
-    println(detectedFormat)
+    // --- Detect AVCC (length-prefixed) or Annex-B (start code) ---
+    val first4 = ByteBuffer.wrap(first64, 0, 4).order(ByteOrder.BIG_ENDIAN).int
+    if (first4 in 1..1_000_000) {
+        val nalHeader = first64[4].toInt() and 0xFF
+        val nalType = nalHeader and 0x1F
+        println("✅ Detected AVCC (length-prefixed), first NAL size=$first4, type=$nalType (${h264NalName(nalType)})")
+        // Scan all NALs in this sample
+        scanNalUnits(reader, firstSampleOffset, firstSampleSize)
+    } else if (first4 == 0x00000001 || first4 == 0x00000100) {
+        val nalType = first64[4].toInt() and 0x1F
+        println("✅ Detected Annex-B (start code), NAL type=$nalType (${h264NalName(nalType)})")
+    } else {
+        println("⚠️ Unknown frame format")
+    }
 }
 
-
-
-
-// Helper function to detect Annex B vs AVCC
-fun detectFrameFormat(frameHeader: ByteArray): String {
-    val buf = ByteBuffer.wrap(frameHeader).order(ByteOrder.BIG_ENDIAN)
-
-    // 1️⃣ Annex B start-code check
-    if (frameHeader.startsWith(byteArrayOf(0x00, 0x00, 0x00, 0x01)) ||
-        frameHeader.startsWith(byteArrayOf(0x00, 0x00, 0x01))
-    ) {
-        val nalType = frameHeader.firstNalType()
-        val name = h264NalName(nalType)
-        return "✅ Detected Annex B (start-code prefixed), NAL type=$nalType ($name)"
+// --- Helper: Scan all NAL units in a sample ---
+fun scanNalUnits(reader: RandomAccessFile, startOffset: Long, sampleSize: Int) {
+    println("\n🔍 Scanning NAL units:")
+    reader.seek(startOffset)
+    var offset = 0
+    while (offset + 4 < sampleSize) {
+        val len = reader.readInt()
+        if (len <= 0 || len > sampleSize - offset - 4) break
+        val nalHeader = reader.readUnsignedByte()
+        val nalType = nalHeader and 0x1F
+        println("  +$offset: type=$nalType (${h264NalName(nalType)}), length=$len")
+        reader.skipBytes(len - 1)
+        offset += 4 + len
     }
-
-    // 2️⃣ AVCC / AVC1 length-prefixed check
-    if (frameHeader.size >= 5) {
-        val prefix = buf.int
-        if (prefix > 0 && prefix < 0x1000000) {      // any plausible length (<=16 MB)
-            val nalType = frameHeader[4].toInt() and 0x1F
-            val name = h264NalName(nalType)
-            return "✅ Detected AVCC (length-prefixed), first NAL size=$prefix, type=$nalType ($name)"
-        }
-    }
-
-    return "⚠️ Unknown frame format"
 }
 
+// --- Helper: Convert NAL type to name ---
 fun h264NalName(type: Int): String = when (type) {
-    1 -> "Non-IDR slice"
-    2 -> "Data partition A"
-    3 -> "Data partition B"
-    4 -> "Data partition C"
-    5 -> "IDR slice"
+    1 -> "Non-IDR Slice"
+    5 -> "IDR Slice"
     6 -> "SEI"
     7 -> "SPS"
     8 -> "PPS"
     9 -> "AUD"
-    10 -> "End of sequence"
-    11 -> "End of stream"
-    else -> "Other"
+    else -> "Unknown"
 }
 
-
-// Helper extensions
-fun ByteArray.startsWith(prefix: ByteArray): Boolean {
-    if (this.size < prefix.size) return false
-    for (i in prefix.indices) {
-        if (this[i] != prefix[i]) return false
-    }
-    return true
-}
-
-// Extract NAL type (bits 1–5 of first byte after start code)
-fun ByteArray.firstNalType(): Int {
-    val start = when {
-        this.startsWith(byteArrayOf(0x00, 0x00, 0x00, 0x01)) -> 4
-        this.startsWith(byteArrayOf(0x00, 0x00, 0x01)) -> 3
-        else -> 0
-    }
-    return if (this.size > start) this[start].toInt() and 0x1F else -1
-}
 
 
 
