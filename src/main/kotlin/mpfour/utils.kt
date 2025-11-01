@@ -26,14 +26,14 @@ data class TfhdBox(
 data class TrunBox(
     val version: Int,
     val flags: Int,
-    val sampleCount: Int,
-
+    
+  
     val dataOffset: Int? = null,
     val firstSampleFlags: Int? = null,
 
     // Instead of storing all samples, store offsets & size to read on demand
-    val entriesOffset: Long,  // where entries start (after header)
-    val entriesSize: Long,    // total size of entries section
+    var entriesOffset: Long,  // where entries start (after header)
+    val trunEndOffset: Long,    // total size of entries section
 
     val boxOffset: Long,
     val boxSize: Long,
@@ -55,6 +55,11 @@ data class TrafBox(
     val tfhd: TfhdBox?,
     val tfdt: TfdtBox?,
     val truns: List<TrunBox>
+)
+
+data class TrunResult(
+    val samples: MutableList<TrunSampleEntry>,
+    val lastEntryOffset: Long
 )
 
 
@@ -503,12 +508,14 @@ fun parseTrun(reader: RandomAccessFile, offset: Long, size: Long): TrunBox {
     // You can later seek to entriesOffset to read samples as needed
 
     return TrunBox(
-        version, flags, sampleCount,
-        dataOffset, firstSampleFlags,
+        version = version,
+        flags =flags,
+        dataOffset = dataOffset,
+        firstSampleFlags =firstSampleFlags,
         entriesOffset = entriesStart,
-        entriesSize = entriesLength,
-        boxOffset = offset - 8,
-        boxSize = size + 8,
+        trunEndOffset = entriesStart + entriesLength,
+        boxOffset = offset,
+        boxSize = size
     )
 }
 

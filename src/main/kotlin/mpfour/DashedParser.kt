@@ -30,6 +30,9 @@ class DashedParser(file: File,val doLogging: Boolean){
     var firstMoofPayloadOffset=0L
     var firstMoofPayloadSize=0L
     var entriesToSkip_Offset=0L
+    val _trafBoxes=mutableListOf<TrafBox>()
+    var totalEntriesInThisMoof=-1L
+    var entriesReadInThisMoof=0L
 
 
     var totalSamplesFromMoof=0
@@ -338,24 +341,87 @@ class DashedParser(file: File,val doLogging: Boolean){
             data.position(boxStart + boxSize)
         }
     }
-    fun getSamples(initialChunk: Boolean) {
-        val mdatPayloadOffset = firstMoofPayloadOffset + firstMoofPayloadSize + 8
 
-        val trafBoxes = parseTraf(reader, firstMoofPayloadOffset, firstMoofPayloadSize)
-        if (trafBoxes.isEmpty()) {
-            println("No traf boxes found")
-            return
+    fun findNextMoof(){
+        reader.seek(firstMoofPayloadOffset + firstMoofPayloadSize + 8)
+        while (reader.filePointer + 8 <= reader.length()) {
+            val startOffsetLoop = reader.filePointer
+
+            val sizeLoop = reader.readInt().toLong()
+            if (sizeLoop < 8) {
+                throw IllegalStateException("Invalid box size $sizeLoop at offset $startOffsetLoop")
+            }
+
+            val typeBytesLoop = ByteArray(4).also { reader.readFully(it) }
+            val boxTypeLoop = String(typeBytesLoop, Charsets.US_ASCII)
+
+            val payloadOffset = reader.filePointer
+            val payloadSize = sizeLoop - 8
+
+            if (doLogging) {
+                println(
+                    "Box: $boxTypeLoop | BoxOffset: $startOffsetLoop | BoxSize: $sizeLoop | " +
+                            "PayloadOffset: $payloadOffset | PayloadSize: ${convertBytes(payloadSize)}"
+                )
+            }
+
+            when (boxTypeLoop) {
+                "moov" -> {
+                    val payload = ByteArray(payloadSize.toInt())
+                    reader.readFully(payload)
+                    parseMoov(payload)
+                }
+
+                "moof" -> {
+                    if (firstMoofPayloadOffset==0L){
+                        firstMoofPayloadOffset=payloadOffset
+                        firstMoofPayloadSize=payloadSize
+                    }
+
+                }
+
+                else -> {
+                    // Skip unknown or irrelevant boxes
+                    reader.seek(payloadOffset + payloadSize)
+                }
+            }
         }
+    }
 
-        val trun = trafBoxes[0].truns.firstOrNull()
-        if (trun == null) {
-            println("No trun found")
-            return
+    fun getSamples(initialChunk: Boolean): MutableList<TrunSampleEntry> {
+        val _entrties=mutableListOf<TrunSampleEntry>()
+        val targetSamples = if (initialChunk) 2 else 6
+        if (firstMoofPayloadOffset!=0L){
+            val mdatPayloadOffset = firstMoofPayloadOffset + firstMoofPayloadSize + 8
+             if (_trafBoxes.isEmpty()){
+                 val trafBoxes = parseTraf(reader, firstMoofPayloadOffset, firstMoofPayloadSize)
+                 _trafBoxes.addAll(trafBoxes)
+                 val trun = _trafBoxes[0].truns.firstOrNull()
+                 val tfhd= _trafBoxes[0].tfhd
+                 val result=getTrunEntries(trun!!,tfhd!!,mdatPayloadOffset,targetSamples)
+                 return result.samples
+
+             }else{
+                 val trun = _trafBoxes[0].truns.firstOrNull()
+                 val tfhd= _trafBoxes[0].tfhd
+                 val result=getTrunEntries(trun!!,tfhd!!,mdatPayloadOffset,targetSamples)
+                 return result.samples
+             }
         }
+        else{
+            findNextMoof()
+            getSamples(initialChunk)
+        }
+        return _entrties
 
-        println("Sample count = ${trun.sampleCount}")
+    }
 
-        // Seek to trun.entriesOffset to read sample table
+    private fun getTrunEntries(
+        trun: TrunBox,
+        tfhd: TfhdBox,
+        mdatPayloadOffset: Long,
+        requiredSamples: Int
+    ): TrunResult {
         reader.seek(trun.entriesOffset)
 
         val hasDuration = trun.flags and 0x000100 != 0
@@ -363,123 +429,56 @@ class DashedParser(file: File,val doLogging: Boolean){
         val hasFlags = trun.flags and 0x000400 != 0
         val hasCTO = trun.flags and 0x000800 != 0
 
-        // Read the first sample entry
-        var sampleSize = 0
-        if (hasDuration) reader.readInt() // skip duration
-        if (hasSize) sampleSize = reader.readInt()
-        if (hasFlags) reader.readInt() // skip flags
-        if (hasCTO) reader.readInt() // skip CTO
+        // Compute starting offset within mdat
+        var currentOffset = mdatPayloadOffset + (trun.dataOffset?.toLong() ?: 0L)
+        val samples = mutableListOf<TrunSampleEntry>()
 
-        println("First sample size = $sampleSize bytes")
+        for (i in 0 until requiredSamples) {
+            val duration = if (hasDuration) reader.readInt() else tfhd.defaultSampleDuration
+            val size = if (hasSize) reader.readInt() else tfhd.defaultSampleSize
+            val flags = if (hasFlags) reader.readInt() else tfhd.defaultSampleFlags
+            val cto = if (hasCTO) reader.readInt() else 0
 
-        // Read full frame from mdat
-        reader.seek(mdatPayloadOffset)
-        val sampleData = ByteArray(sampleSize)
-        reader.readFully(sampleData)
 
-        println("Read first frame (${sampleData.size} bytes)")
+            if (size != null && size > 0) {
+                val isSyncSample = if (hasFlags || tfhd.defaultSampleFlags != null) {
+                    // In ISO BMFF: keyframe if sample_depends_on == 2 (bits 25–26 == 2)
+                    val sampleDependsOn = (flags?.ushr(24))?.and(0x03)
+                    sampleDependsOn == 2 || flags == 0
+                } else {
+                    // Assume sync if no flags provided
+                    true
+                }
 
-        // Save .h264 file (auto uses stsdBox)
-        val h264File = saveH264Frame(
-            sampleData,
-            outputDir = File("frames"),
-            fileName = "frame.h264",
-            stsdBox = stsdBox!!
-        )
-        println("Saved H.264 frame: ${h264File.absolutePath}")
+                samples += TrunSampleEntry(
+                    frameSize = size,
+                    frameAbsOffset = currentOffset,
+                    duration = duration,
+                    flags = flags,
+                    compositionTimeOffset = cto,
+                    isSyncSample = isSyncSample
+                )
+                currentOffset += size
+                entriesReadInThisMoof++
 
-        // Optional: call FFmpeg (if available on system path)
-        try {
-            val outputImage = File("keyframe.jpg")
-            val process = ProcessBuilder(
-                "ffmpeg",
-                "-y",
-                "-i", h264File.absolutePath,
-                "-frames:v", "1",
-                outputImage.absolutePath
-            ).inheritIO().start()
-            process.waitFor()
-
-            if (outputImage.exists()) {
-                println("✅ Extracted keyframe image: ${outputImage.absolutePath}")
+                if (entriesReadInThisMoof.toInt() ==_trafBoxes[0].truns[0].sampleCount){
+                    firstMoofPayloadOffset=0L
+                    entriesReadInThisMoof=0L
+                }
             } else {
-                println("⚠️ FFmpeg did not produce an image. Check SPS/PPS or FFmpeg output.")
+                println("sample[$i]: invalid size=$size, skipping")
             }
-        } catch (e: Exception) {
-            println("⚠️ FFmpeg not found or failed to execute: ${e.message}")
         }
+
+
+
+        return TrunResult(
+            samples = samples,
+            lastEntryOffset = reader.filePointer
+        )
     }
-
-    /*fun saveH264Frame(
-        frame: ByteArray,
-        outputDir: File = File(System.getProperty("java.io.tmpdir")),
-        fileName: String = "frame.h264",
-        sps: ByteArray? = null,
-        pps: ByteArray? = null
-    ): File {
-        val (resolvedSps, resolvedPps) = when {
-            sps != null && pps != null -> Pair(sps, pps)
-            stsdBox != null -> extractSpsPpsFromStsd(stsdBox!!) ?: error("Failed to parse SPS/PPS from stsdBox")
-            else -> error("No SPS/PPS data available")
-        }
-
-        // convert length-prefixed NALs to start code prefixed
-        fun convertToAnnexB(data: ByteArray): ByteArray {
-            val out = ByteArrayOutputStream()
-            val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
-            while (buf.remaining() > 4) {
-                val len = buf.int
-                if (len <= 0 || len > buf.remaining()) break
-                out.write(byteArrayOf(0x00, 0x00, 0x00, 0x01))
-                val nal = ByteArray(len)
-                buf.get(nal)
-                out.write(nal)
-            }
-            return out.toByteArray()
-        }
-
-        val convertedFrame = convertToAnnexB(frame)
-
-        if (!outputDir.exists()) outputDir.mkdirs()
-        val outputFile = File(outputDir, fileName)
-
-        FileOutputStream(outputFile).use { fos ->
-            fos.write(byteArrayOf(0x00, 0x00, 0x00, 0x01))
-            fos.write(resolvedSps)
-            fos.write(byteArrayOf(0x00, 0x00, 0x00, 0x01))
-            fos.write(resolvedPps)
-            fos.write(convertedFrame)
-        }
-
-        return outputFile
-    }*/
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
 
 }
-
-/*moof
- └── mfhd (Movie Fragment Header)
- └── traf (Track Fragment)
-      ├── tfhd (Track Fragment Header)
-      ├── tfdt (Track Fragment Decode Time)
-      ├── trun (Track Run)  ← contains the actual sample info
-      └── (optional: sdtp, senc, subs, etc.)
-*/
