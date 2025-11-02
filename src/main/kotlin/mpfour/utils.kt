@@ -504,8 +504,7 @@ fun parseTrun(reader: RandomAccessFile, offset: Long, size: Long): TrunBox {
     val entriesStart = reader.filePointer
     val entriesLength = size - (entriesStart - offset)
 
-    // We don't parse all sample entries here (to save memory)
-    // You can later seek to entriesOffset to read samples as needed
+
 
     return TrunBox(
         version = version,

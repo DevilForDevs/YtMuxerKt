@@ -25,17 +25,12 @@ class DashedParser(file: File,val doLogging: Boolean){
     var handlerType: String = ""
 
     var stsdBox: ByteArray? =null
-
-
-    var firstMoofPayloadOffset=0L
-    var firstMoofPayloadSize=0L
     var entriesToSkip_Offset=0L
     val _trafBoxes=mutableListOf<TrafBox>()
-    var totalEntriesInThisMoof=-1L
-    var entriesReadInThisMoof=0L
-
 
     var totalSamplesFromMoof=0
+
+    val moofsList=mutableListOf<BoxInfo>()
 
 
     //fields updated from dashedWriter
@@ -106,10 +101,10 @@ class DashedParser(file: File,val doLogging: Boolean){
                 }
 
                 "moof" -> {
-                    if (firstMoofPayloadOffset==0L){
-                        firstMoofPayloadOffset=payloadOffset
-                        firstMoofPayloadSize=payloadSize
-                    }
+                    moofsList.add(BoxInfo(
+                        offset = payloadOffset,
+                        size = payloadSize
+                    ))
                     val payload = ByteArray(payloadSize.toInt())
                     reader.readFully(payload)
                     countSamplesInMoof(payload)
@@ -126,10 +121,8 @@ class DashedParser(file: File,val doLogging: Boolean){
 
 
 
-    fun countSamplesInMoof(moofData: ByteArray): Int {
+    fun countSamplesInMoof(moofData: ByteArray){
         val buffer = ByteBuffer.wrap(moofData).order(ByteOrder.BIG_ENDIAN)
-        var sampleCount = 0
-
         while (buffer.remaining() >= 8) {
             val startPos = buffer.position()
             if (buffer.remaining() < 8) break
@@ -154,7 +147,7 @@ class DashedParser(file: File,val doLogging: Boolean){
                         if (subSize >= 12) {
                             buffer.position(buffer.position() + 4) // skip version & flags
                             val count = buffer.int
-                            sampleCount += count
+                            totalSamplesFromMoof += count
                             buffer.position(boxStart + subSize) // skip remaining of trun
                         } else {
                             break // malformed trun
@@ -167,8 +160,7 @@ class DashedParser(file: File,val doLogging: Boolean){
                 buffer.position(startPos + size)
             }
         }
-        totalSamplesFromMoof+=sampleCount
-        return sampleCount
+
     }
 
 
@@ -342,79 +334,69 @@ class DashedParser(file: File,val doLogging: Boolean){
         }
     }
 
-    fun findNextMoof(){
-        reader.seek(firstMoofPayloadOffset + firstMoofPayloadSize + 8)
-        while (reader.filePointer + 8 <= reader.length()) {
-            val startOffsetLoop = reader.filePointer
 
-            val sizeLoop = reader.readInt().toLong()
-            if (sizeLoop < 8) {
-                throw IllegalStateException("Invalid box size $sizeLoop at offset $startOffsetLoop")
-            }
 
-            val typeBytesLoop = ByteArray(4).also { reader.readFully(it) }
-            val boxTypeLoop = String(typeBytesLoop, Charsets.US_ASCII)
 
-            val payloadOffset = reader.filePointer
-            val payloadSize = sizeLoop - 8
 
-            if (doLogging) {
-                println(
-                    "Box: $boxTypeLoop | BoxOffset: $startOffsetLoop | BoxSize: $sizeLoop | " +
-                            "PayloadOffset: $payloadOffset | PayloadSize: ${convertBytes(payloadSize)}"
-                )
-            }
-
-            when (boxTypeLoop) {
-                "moov" -> {
-                    val payload = ByteArray(payloadSize.toInt())
-                    reader.readFully(payload)
-                    parseMoov(payload)
-                }
-
-                "moof" -> {
-                    if (firstMoofPayloadOffset==0L){
-                        firstMoofPayloadOffset=payloadOffset
-                        firstMoofPayloadSize=payloadSize
-                    }
-
-                }
-
-                else -> {
-                    // Skip unknown or irrelevant boxes
-                    reader.seek(payloadOffset + payloadSize)
-                }
-            }
-        }
-    }
 
     fun getSamples(initialChunk: Boolean): MutableList<TrunSampleEntry> {
-        val _entrties=mutableListOf<TrunSampleEntry>()
+        val _entries = mutableListOf<TrunSampleEntry>()
         val targetSamples = if (initialChunk) 2 else 6
-        if (firstMoofPayloadOffset!=0L){
-            val mdatPayloadOffset = firstMoofPayloadOffset + firstMoofPayloadSize + 8
-             if (_trafBoxes.isEmpty()){
-                 val trafBoxes = parseTraf(reader, firstMoofPayloadOffset, firstMoofPayloadSize)
-                 _trafBoxes.addAll(trafBoxes)
-                 val trun = _trafBoxes[0].truns.firstOrNull()
-                 val tfhd= _trafBoxes[0].tfhd
-                 val result=getTrunEntries(trun!!,tfhd!!,mdatPayloadOffset,targetSamples)
-                 return result.samples
 
-             }else{
-                 val trun = _trafBoxes[0].truns.firstOrNull()
-                 val tfhd= _trafBoxes[0].tfhd
-                 val result=getTrunEntries(trun!!,tfhd!!,mdatPayloadOffset,targetSamples)
-                 return result.samples
-             }
+        if (moofsList.isEmpty()) {
+            println("No more moofs left")
+            return _entries
         }
-        else{
-            findNextMoof()
-            getSamples(initialChunk)
-        }
-        return _entrties
 
+        val requiredMoof = moofsList[0]
+        val mdatPayloadOffset = requiredMoof.offset + requiredMoof.size + 8
+
+        // Parse trafs if needed
+        if (_trafBoxes.isEmpty()) {
+            val trafBoxes = parseTraf(reader, requiredMoof.offset, requiredMoof.size)
+            _trafBoxes.addAll(trafBoxes)
+            entriesToSkip_Offset = -1L
+        }
+
+        val traf = _trafBoxes[0]
+        val tfhd = traf.tfhd!!
+        var samplesThisCall = 0
+
+        // 🔧 Loop over all truns in the traf
+        for (trunIndex in traf.truns.indices) {
+            val trun = traf.truns[trunIndex]
+            if (entriesToSkip_Offset > 0) {
+                trun.entriesOffset = entriesToSkip_Offset
+            }
+
+            val entries = getTrunEntries(trun, tfhd, mdatPayloadOffset, targetSamples)
+            _entries.addAll(entries.samples)
+            entriesToSkip_Offset = entries.lastEntryOffset
+            samplesThisCall += entries.samples.size
+
+            if (samplesThisCall >= targetSamples) break
+
+            // 🟡 If we've reached the end of this trun, move to next
+            if (entriesToSkip_Offset >= trun.trunEndOffset) {
+                println("Finished trun $trunIndex in moof @${requiredMoof.offset}")
+                entriesToSkip_Offset = -1L
+            }
+        }
+
+        // 🟢 After all truns are consumed, clear traf + remove moof
+        val lastTrun = traf.truns.last()
+        if (entriesToSkip_Offset >= lastTrun.trunEndOffset) {
+            println("Finished moof at offset=${requiredMoof.offset}")
+            _trafBoxes.clear()
+            moofsList.removeAt(0)
+            entriesToSkip_Offset = -1L
+        }
+
+        return _entries
     }
+
+
+
 
     private fun getTrunEntries(
         trun: TrunBox,
@@ -423,7 +405,6 @@ class DashedParser(file: File,val doLogging: Boolean){
         requiredSamples: Int
     ): TrunResult {
         reader.seek(trun.entriesOffset)
-
         val hasDuration = trun.flags and 0x000100 != 0
         val hasSize = trun.flags and 0x000200 != 0
         val hasFlags = trun.flags and 0x000400 != 0
@@ -438,6 +419,7 @@ class DashedParser(file: File,val doLogging: Boolean){
             val size = if (hasSize) reader.readInt() else tfhd.defaultSampleSize
             val flags = if (hasFlags) reader.readInt() else tfhd.defaultSampleFlags
             val cto = if (hasCTO) reader.readInt() else 0
+
 
 
             if (size != null && size > 0) {
@@ -459,26 +441,23 @@ class DashedParser(file: File,val doLogging: Boolean){
                     isSyncSample = isSyncSample
                 )
                 currentOffset += size
-                entriesReadInThisMoof++
 
-                if (entriesReadInThisMoof.toInt() ==_trafBoxes[0].truns[0].sampleCount){
-                    firstMoofPayloadOffset=0L
-                    entriesReadInThisMoof=0L
-                }
+
             } else {
                 println("sample[$i]: invalid size=$size, skipping")
             }
         }
+        entriesToSkip_Offset=reader.filePointer
 
-
-
+        if (reader.filePointer==trun.trunEndOffset){
+            _trafBoxes.clear()
+            entriesToSkip_Offset=-1
+            moofsList.removeAt(0)
+        }
         return TrunResult(
             samples = samples,
             lastEntryOffset = reader.filePointer
         )
     }
-
-
-
 
 }

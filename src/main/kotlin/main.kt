@@ -11,28 +11,17 @@ fun main() {
     val parsedVideo = DashedParser(video, false)
     parsedVideo.parse()
 
-    val videoSamples = parsedVideo.getSamples(true)
+    var videoSamples=parsedVideo.getSamples(true)
+
+    while (videoSamples.isNotEmpty()){
+        for (samp in videoSamples.take(10)){
+            println("Sample Offset Abs: ${samp.frameAbsOffset} Sample Size: ${samp.frameSize}  Keysampe: ${samp.isSyncSample}")
+        }
+        videoSamples=parsedVideo.getSamples(false)
+    }
+    println(parsedVideo.totalSamplesFromMoof)
 
 
 
 
 }
-
-
-
-
-
-/* parsedAudio.parse()
-
-    val outputFile= File("result.mp4")
-    if (outputFile.exists()){
-        println(outputFile.delete())
-    }
-
-    val muxer= DashedWriter(file = outputFile,listOf(parsedVideo,parsedAudio), progress = {progress,percent->
-        println(progress)
-    })
-    muxer.build()
-
-    val resultPraser= DashedParser(outputFile, doLogging = true)
-    resultPraser.parse()*/
