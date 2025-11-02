@@ -25,12 +25,15 @@ class DashedParser(file: File,val doLogging: Boolean){
     var handlerType: String = ""
 
     var stsdBox: ByteArray? =null
-    var entriesToSkip_Offset=0L
+    private var entriesToSkip_Offset: Long = -1L
+    private var mdatCurrentOffset: Long = -1L
     val _trafBoxes=mutableListOf<TrafBox>()
 
     var totalSamplesFromMoof=0
 
     val moofsList=mutableListOf<BoxInfo>()
+    private var lastSampleEndOffset: Long = -1L
+
 
 
     //fields updated from dashedWriter
@@ -334,84 +337,71 @@ class DashedParser(file: File,val doLogging: Boolean){
         }
     }
 
-
-
-
-
-
     fun getSamples(initialChunk: Boolean): MutableList<TrunSampleEntry> {
         val _entries = mutableListOf<TrunSampleEntry>()
         val targetSamples = if (initialChunk) 2 else 6
-
-        if (moofsList.isEmpty()) {
-            println("No more moofs left")
-            return _entries
-        }
-
         val requiredMoof = moofsList[0]
-        val mdatPayloadOffset = requiredMoof.offset + requiredMoof.size + 8
 
-        // Parse trafs if needed
+        // Parse traf boxes only once per moof
         if (_trafBoxes.isEmpty()) {
-            val trafBoxes = parseTraf(reader, requiredMoof.offset, requiredMoof.size)
-            _trafBoxes.addAll(trafBoxes)
-            entriesToSkip_Offset = -1L
+            val t_boxes = parseTraf(reader, requiredMoof.offset, requiredMoof.size)
+            _trafBoxes.addAll(t_boxes)
         }
 
-        val traf = _trafBoxes[0]
-        val tfhd = traf.tfhd!!
-        var samplesThisCall = 0
+        val requiredTraf = _trafBoxes[0]
+        val requiredTrun = requiredTraf.truns[0]
+        val requiredTfhd = requiredTraf.tfhd!!
 
-        // 🔧 Loop over all truns in the traf
-        for (trunIndex in traf.truns.indices) {
-            val trun = traf.truns[trunIndex]
-            if (entriesToSkip_Offset > 0) {
-                trun.entriesOffset = entriesToSkip_Offset
-            }
-
-            val entries = getTrunEntries(trun, tfhd, mdatPayloadOffset, targetSamples)
-            _entries.addAll(entries.samples)
-            entriesToSkip_Offset = entries.lastEntryOffset
-            samplesThisCall += entries.samples.size
-
-            if (samplesThisCall >= targetSamples) break
-
-            // 🟡 If we've reached the end of this trun, move to next
-            if (entriesToSkip_Offset >= trun.trunEndOffset) {
-                println("Finished trun $trunIndex in moof @${requiredMoof.offset}")
-                entriesToSkip_Offset = -1L
-            }
+        // Compute base mdat offset (once per moof)
+        val baseMdatOffset = requiredMoof.offset + requiredMoof.size + 8
+        if (mdatCurrentOffset < 0) {
+            mdatCurrentOffset = baseMdatOffset + (requiredTrun.dataOffset?.toLong() ?: 0L)
         }
 
-        // 🟢 After all truns are consumed, clear traf + remove moof
-        val lastTrun = traf.truns.last()
-        if (entriesToSkip_Offset >= lastTrun.trunEndOffset) {
-            println("Finished moof at offset=${requiredMoof.offset}")
+        // Determine where to continue reading trun entries
+        if (entriesToSkip_Offset > 0) {
+            requiredTrun.entriesOffset = entriesToSkip_Offset
+        }
+
+        println("Entries Start offset: ${requiredTrun.entriesOffset}")
+        println("Current mdat offset: $mdatCurrentOffset")
+
+        val trunResult = getTrunEntries(
+            trun = requiredTrun,
+            tfhd = requiredTfhd,
+            mdatStartOffset = mdatCurrentOffset,
+            requiredSamples = targetSamples
+        )
+
+        // update tracking pointers
+        entriesToSkip_Offset = trunResult.lastEntryOffset
+        mdatCurrentOffset = trunResult.lastDataOffset
+
+        // if reached end of trun
+        if (entriesToSkip_Offset >= requiredTrun.trunEndOffset) {
             _trafBoxes.clear()
+            entriesToSkip_Offset = -1
+            mdatCurrentOffset = -1
             moofsList.removeAt(0)
-            entriesToSkip_Offset = -1L
         }
 
-        return _entries
+        return trunResult.samples
     }
-
-
-
 
     private fun getTrunEntries(
         trun: TrunBox,
         tfhd: TfhdBox,
-        mdatPayloadOffset: Long,
+        mdatStartOffset: Long,
         requiredSamples: Int
     ): TrunResult {
         reader.seek(trun.entriesOffset)
+
         val hasDuration = trun.flags and 0x000100 != 0
         val hasSize = trun.flags and 0x000200 != 0
         val hasFlags = trun.flags and 0x000400 != 0
         val hasCTO = trun.flags and 0x000800 != 0
 
-        // Compute starting offset within mdat
-        var currentOffset = mdatPayloadOffset + (trun.dataOffset?.toLong() ?: 0L)
+        var currentOffset = mdatStartOffset
         val samples = mutableListOf<TrunSampleEntry>()
 
         for (i in 0 until requiredSamples) {
@@ -420,17 +410,9 @@ class DashedParser(file: File,val doLogging: Boolean){
             val flags = if (hasFlags) reader.readInt() else tfhd.defaultSampleFlags
             val cto = if (hasCTO) reader.readInt() else 0
 
-
-
             if (size != null && size > 0) {
-                val isSyncSample = if (hasFlags || tfhd.defaultSampleFlags != null) {
-                    // In ISO BMFF: keyframe if sample_depends_on == 2 (bits 25–26 == 2)
-                    val sampleDependsOn = (flags?.ushr(24))?.and(0x03)
-                    sampleDependsOn == 2 || flags == 0
-                } else {
-                    // Assume sync if no flags provided
-                    true
-                }
+                val sampleDependsOn = (flags?.ushr(24))?.and(0x03)
+                val isSyncSample = sampleDependsOn == 2 || flags == 0
 
                 samples += TrunSampleEntry(
                     frameSize = size,
@@ -440,24 +422,24 @@ class DashedParser(file: File,val doLogging: Boolean){
                     compositionTimeOffset = cto,
                     isSyncSample = isSyncSample
                 )
+
+                println("Sample Offset Abs: $currentOffset Sample Size: $size  Keysample: $isSyncSample")
+
                 currentOffset += size
-
-
             } else {
                 println("sample[$i]: invalid size=$size, skipping")
             }
-        }
-        entriesToSkip_Offset=reader.filePointer
 
-        if (reader.filePointer==trun.trunEndOffset){
-            _trafBoxes.clear()
-            entriesToSkip_Offset=-1
-            moofsList.removeAt(0)
+            // stop early if reached end of trun box
+            if (reader.filePointer >= trun.trunEndOffset) break
         }
+
         return TrunResult(
             samples = samples,
-            lastEntryOffset = reader.filePointer
+            lastEntryOffset = reader.filePointer,
+            lastDataOffset = currentOffset
         )
     }
+
 
 }

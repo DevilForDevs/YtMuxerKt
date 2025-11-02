@@ -59,7 +59,8 @@ data class TrafBox(
 
 data class TrunResult(
     val samples: MutableList<TrunSampleEntry>,
-    val lastEntryOffset: Long
+    val lastEntryOffset: Long,
+    val  lastDataOffset: Long
 )
 
 
