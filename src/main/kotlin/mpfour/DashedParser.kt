@@ -25,15 +25,16 @@ class DashedParser(file: File,val doLogging: Boolean){
     var handlerType: String = ""
 
     var stsdBox: ByteArray? =null
-    private var entriesToSkip_Offset: Long = -1L
-    private var mdatCurrentOffset: Long = -1L
-    val _trafBoxes=mutableListOf<TrafBox>()
 
-    var totalSamplesFromMoof=0
+    /**
+     * This is total count of entries/samples
+     * found in different truns of different moofs
+     * used for tracking progress by dashed writter
+     */
+    var trunEntries=0
 
-    val moofsList=mutableListOf<BoxInfo>()
-    private var lastSampleEndOffset: Long = -1L
-
+    val moofsList=mutableListOf<MoofBox>()
+    var currentMoofBox: MoofParser?=null
 
 
     //fields updated from dashedWriter
@@ -46,9 +47,6 @@ class DashedParser(file: File,val doLogging: Boolean){
     var runLength = 0
     var initialChunk=true
     val samplesPerChunkList = mutableListOf<Int>()
-
-
-
 
     fun parse() {
         reader.seek(0)
@@ -104,13 +102,16 @@ class DashedParser(file: File,val doLogging: Boolean){
                 }
 
                 "moof" -> {
-                    moofsList.add(BoxInfo(
-                        offset = payloadOffset,
-                        size = payloadSize
-                    ))
                     val payload = ByteArray(payloadSize.toInt())
                     reader.readFully(payload)
-                    countSamplesInMoof(payload)
+                    val entriesInThisMoof=countEntriesInMoof(payload)
+                    trunEntries+=entriesInThisMoof
+                    moofsList.add(MoofBox(
+                        boxOffset = payloadOffset,
+                        boxSize = payloadSize,
+                        totalEntries = entriesInThisMoof,
+                        entriesRead = 0
+                    ))
                 }
 
                 else -> {
@@ -121,40 +122,29 @@ class DashedParser(file: File,val doLogging: Boolean){
         }
     }
 
-
-
-
-    fun countSamplesInMoof(moofData: ByteArray){
+    fun countEntriesInMoof(moofData: ByteArray): Int {
         val buffer = ByteBuffer.wrap(moofData).order(ByteOrder.BIG_ENDIAN)
+        var totalTrunEntries = 0
+
         while (buffer.remaining() >= 8) {
             val startPos = buffer.position()
-            if (buffer.remaining() < 8) break
-
             val size = buffer.int
-            val typeBytes = ByteArray(4)
-            buffer.get(typeBytes)
-            val type = String(typeBytes)
+            val type = String(ByteArray(4).also { buffer.get(it) })
 
             if (type == "traf") {
                 val trafEnd = startPos + size
-                while (buffer.position() < trafEnd) {
+                while (buffer.position() < trafEnd && buffer.remaining() >= 8) {
                     val boxStart = buffer.position()
-                    if (buffer.remaining() < 8) break
-
                     val subSize = buffer.int
-                    val subTypeBytes = ByteArray(4)
-                    buffer.get(subTypeBytes)
-                    val subType = String(subTypeBytes)
+                    val subType = String(ByteArray(4).also { buffer.get(it) })
 
                     if (subType == "trun") {
-                        if (subSize >= 12) {
+                        if (subSize >= 12 && buffer.remaining() >= 8) {
                             buffer.position(buffer.position() + 4) // skip version & flags
-                            val count = buffer.int
-                            totalSamplesFromMoof += count
-                            buffer.position(boxStart + subSize) // skip remaining of trun
-                        } else {
-                            break // malformed trun
+                            val entryCount = buffer.int
+                            totalTrunEntries += entryCount
                         }
+                        buffer.position(boxStart + subSize)
                     } else {
                         buffer.position(boxStart + subSize)
                     }
@@ -164,9 +154,8 @@ class DashedParser(file: File,val doLogging: Boolean){
             }
         }
 
+        return totalTrunEntries
     }
-
-
 
     fun parseMoov(payload: ByteArray) {
         val buffer = ByteBuffer.wrap(payload)
@@ -342,104 +331,19 @@ class DashedParser(file: File,val doLogging: Boolean){
         val targetSamples = if (initialChunk) 2 else 6
         val requiredMoof = moofsList[0]
 
-        // Parse traf boxes only once per moof
-        if (_trafBoxes.isEmpty()) {
-            val t_boxes = parseTraf(reader, requiredMoof.offset, requiredMoof.size)
-            _trafBoxes.addAll(t_boxes)
-        }
-
-        val requiredTraf = _trafBoxes[0]
-        val requiredTrun = requiredTraf.truns[0]
-        val requiredTfhd = requiredTraf.tfhd!!
-
-        // Compute base mdat offset (once per moof)
-        val baseMdatOffset = requiredMoof.offset + requiredMoof.size + 8
-        if (mdatCurrentOffset < 0) {
-            mdatCurrentOffset = baseMdatOffset + (requiredTrun.dataOffset?.toLong() ?: 0L)
-        }
-
-        // Determine where to continue reading trun entries
-        if (entriesToSkip_Offset > 0) {
-            requiredTrun.entriesOffset = entriesToSkip_Offset
-        }
-
-        println("Entries Start offset: ${requiredTrun.entriesOffset}")
-        println("Current mdat offset: $mdatCurrentOffset")
-
-        val trunResult = getTrunEntries(
-            trun = requiredTrun,
-            tfhd = requiredTfhd,
-            mdatStartOffset = mdatCurrentOffset,
-            requiredSamples = targetSamples
-        )
-
-        // update tracking pointers
-        entriesToSkip_Offset = trunResult.lastEntryOffset
-        mdatCurrentOffset = trunResult.lastDataOffset
-
-        // if reached end of trun
-        if (entriesToSkip_Offset >= requiredTrun.trunEndOffset) {
-            _trafBoxes.clear()
-            entriesToSkip_Offset = -1
-            mdatCurrentOffset = -1
+        if (requiredMoof.totalEntries==requiredMoof.entriesRead){
+            println("all entries in this moof is read")
             moofsList.removeAt(0)
+
+        }else{
+            val moofParser= MoofParser(reader,requiredMoof.offset,requiredMoof.size)
+            moofParser.getEntries()
+
         }
 
-        return trunResult.samples
+        return _entries
     }
 
-    private fun getTrunEntries(
-        trun: TrunBox,
-        tfhd: TfhdBox,
-        mdatStartOffset: Long,
-        requiredSamples: Int
-    ): TrunResult {
-        reader.seek(trun.entriesOffset)
-
-        val hasDuration = trun.flags and 0x000100 != 0
-        val hasSize = trun.flags and 0x000200 != 0
-        val hasFlags = trun.flags and 0x000400 != 0
-        val hasCTO = trun.flags and 0x000800 != 0
-
-        var currentOffset = mdatStartOffset
-        val samples = mutableListOf<TrunSampleEntry>()
-
-        for (i in 0 until requiredSamples) {
-            val duration = if (hasDuration) reader.readInt() else tfhd.defaultSampleDuration
-            val size = if (hasSize) reader.readInt() else tfhd.defaultSampleSize
-            val flags = if (hasFlags) reader.readInt() else tfhd.defaultSampleFlags
-            val cto = if (hasCTO) reader.readInt() else 0
-
-            if (size != null && size > 0) {
-                val sampleDependsOn = (flags?.ushr(24))?.and(0x03)
-                val isSyncSample = sampleDependsOn == 2 || flags == 0
-
-                samples += TrunSampleEntry(
-                    frameSize = size,
-                    frameAbsOffset = currentOffset,
-                    duration = duration,
-                    flags = flags,
-                    compositionTimeOffset = cto,
-                    isSyncSample = isSyncSample
-                )
-
-                println("Sample Offset Abs: $currentOffset Sample Size: $size  Keysample: $isSyncSample")
-
-                currentOffset += size
-            } else {
-                println("sample[$i]: invalid size=$size, skipping")
-            }
-
-            // stop early if reached end of trun box
-            if (reader.filePointer >= trun.trunEndOffset) break
-        }
-
-        return TrunResult(
-            samples = samples,
-            lastEntryOffset = reader.filePointer,
-            lastDataOffset = currentOffset
-        )
-    }
 
 
 }

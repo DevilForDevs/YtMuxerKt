@@ -6,14 +6,7 @@ fun main() {
     val parsedVideo = DashedParser(video, false)
     parsedVideo.parse()
 
-    var videoSamples=parsedVideo.getSamples(true)
-
-    while (videoSamples.isNotEmpty()){
-        for (samp in videoSamples){
-            println("Sample Offset Abs: ${samp.frameAbsOffset} Sample Size: ${samp.frameSize}  Keysampe: ${samp.isSyncSample}")
-        }
-        videoSamples=parsedVideo.getSamples(false)
-    }
+    parsedVideo.getSamples(true)
 
 
 
