@@ -126,64 +126,111 @@ class MoofParser(
             dataOffset = dataOffset,
             firstSampleFlags = firstSampleFlags,
             entriesOffset = entriesStart,
-            trunEndOffset = entriesLength
+            trunEndOffset = size+offset,
+            sampleOffset = mdatOffset
         )
     }
 
-    fun getEntries() {
-        val traf = trafs[0]
-        val trun = traf.truns[0]
+    fun getEntries(requiredSamples: Int): List<TrunSampleEntry> {
+        val _entries = mutableListOf<TrunSampleEntry>()
 
-        // sanity: ensure entriesOffset is set
+        // If no trafs left, nothing to do
+        if (trafs.isEmpty()) return _entries
+
+        val traf = trafs[0]
+
+        // If current traf is empty (all truns consumed), remove and continue
+        if (traf.truns.isEmpty()) {
+            trafs.removeAt(0)
+
+            // Recurse if there are still trafs remaining
+            return if (trafs.isNotEmpty()) {
+                _entries += getEntries(requiredSamples)
+                _entries
+            } else {
+                _entries
+            }
+        }
+
+        // Otherwise, parse from the first trun in this traf
+        val parsedEntries = getTrunEntries(traf, requiredSamples)
+        _entries += parsedEntries
+
+        // If this traf got exhausted (its truns list now empty), move to next traf
+        if (traf.truns.isEmpty()) {
+            trafs.removeAt(0)
+            if (trafs.isNotEmpty()) {
+                _entries += getEntries(requiredSamples)
+            }
+        }
+
+        return _entries
+    }
+
+    fun getTrunEntries(trafBox: TrafBox, requiredSamples: Int): List<TrunSampleEntry> {
+        if (trafBox.truns.isEmpty()) return emptyList()
+        val trun = trafBox.truns[0]
+        val _entries = mutableListOf<TrunSampleEntry>()
+
+        // Move to last saved read position
         reader.seek(trun.entriesOffset)
 
         val hasSampleDuration = (trun.flags and 0x000100) != 0
         val hasSampleSize = (trun.flags and 0x000200) != 0
         val hasSampleFlags = (trun.flags and 0x000400) != 0
-        val hasSampleCompositionTimeOffset = (trun.flags and 0x000800) != 0
+        val hasSampleCTO = (trun.flags and 0x000800) != 0
 
-        // compute per-sample size from flags
         var perSampleBytes = 0
         if (hasSampleDuration) perSampleBytes += 4
         if (hasSampleSize) perSampleBytes += 4
         if (hasSampleFlags) perSampleBytes += 4
-        if (hasSampleCompositionTimeOffset) perSampleBytes += 4
+        if (hasSampleCTO) perSampleBytes += 4
 
-        // guard: avoid insane sample counts
-        val maxPossibleSamples = if (perSampleBytes > 0) (trun.trunEndOffset / perSampleBytes).toInt() else Int.MAX_VALUE
-        val sampleCount = trun.totalSampleCount.coerceAtMost(maxPossibleSamples)
+        val maxPossibleSamples =
+            if (perSampleBytes > 0) ((trun.trunEndOffset - trun.entriesOffset) / perSampleBytes).toInt()
+            else Int.MAX_VALUE
 
-        println("---- Parsing trun entries ----")
-        println("Version: ${trun.version}, Flags: ${String.format("0x%06X", trun.flags)}")
-        println("Sample count (declared): ${trun.totalSampleCount}, (capped to) $sampleCount")
-        println("Data offset: ${trun.dataOffset ?: "none"}")
-        println("First sample flags: ${trun.firstSampleFlags?.let { String.format("0x%08X", it) } ?: "none"}")
-        println("--------------------------------")
 
-        for (i in 0 until sampleCount) {
+        var sampleStart = trun.sampleOffset
+        var samplesRead = 0
+        while (samplesRead < requiredSamples) {
             val sampleDuration = if (hasSampleDuration) reader.readInt() else null
             val sampleSize = if (hasSampleSize) reader.readInt() else null
             val sampleFlags = if (hasSampleFlags) reader.readInt() else null
-            val sampleCTO = if (hasSampleCompositionTimeOffset) {
-                if (trun.version == 0) reader.readInt()
-                else reader.readInt().toLong() // version 1: signed 32-bit
+            val sampleCTO = if (hasSampleCTO) {
+                if (trun.version == 0) reader.readInt().toLong()
+                else reader.readInt().toLong()
             } else null
 
-            println("Entry #$i:")
-            println("  Duration = ${sampleDuration ?: "-"}")
-            println("  Size     = ${sampleSize ?: "-"}")
-            println("  Flags    = ${sampleFlags?.let { String.format("0x%08X", it) } ?: "-"}")
-            println("  CTO      = ${sampleCTO ?: "-"}")
-            println("-------------------------------")
-        }
+            val isSync = sampleFlags?.let { (it and 0x00010000) == 0 } ?: true
 
-        // If declared count > capped count, warn
-        if (trun.totalSampleCount > sampleCount) {
-            println("Warning: declared sample_count (${trun.totalSampleCount}) exceeds available data; parsing capped at $sampleCount.")
-        } else {
-            println("Finished reading $sampleCount trun entries ✅")
+            _entries.add(
+                TrunSampleEntry(
+                    frameSize = sampleSize ?: 0,
+                    frameAbsOffset = sampleStart,
+                    duration = sampleDuration ?: 0,
+                    flags = sampleFlags ?: 0,
+                    compositionTimeOffset = sampleCTO?.toInt() ?: 0,
+                    isSyncSample = isSync
+                )
+            )
+
+
+            if (sampleSize != null) sampleStart += sampleSize
+            samplesRead++
         }
+        // Save updated read positions for next call
+        trun.sampleOffset = sampleStart
+        trun.entriesOffset += samplesRead * perSampleBytes
+        if (reader.filePointer==trun.trunEndOffset){
+            trafBox.truns.removeAt(0)
+
+        }
+        return _entries
     }
+
+
+
 
 }
 

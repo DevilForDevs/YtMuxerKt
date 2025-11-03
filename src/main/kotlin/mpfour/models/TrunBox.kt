@@ -7,5 +7,6 @@ data class TrunBox(
     val dataOffset: Int? = null,
     val firstSampleFlags: Int? = null,
     var entriesOffset: Long,
+    var sampleOffset: Long,
     val trunEndOffset: Long,
 )

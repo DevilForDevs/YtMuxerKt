@@ -326,24 +326,55 @@ class DashedParser(file: File,val doLogging: Boolean){
         }
     }
 
-    fun getSamples(initialChunk: Boolean): MutableList<TrunSampleEntry> {
-        val _entries = mutableListOf<TrunSampleEntry>()
+    fun getSamples(initialChunk: Boolean): List<TrunSampleEntry> {
+        val entries = mutableListOf<TrunSampleEntry>()
         val targetSamples = if (initialChunk) 2 else 6
-        val requiredMoof = moofsList[0]
 
-        if (requiredMoof.totalEntries==requiredMoof.entriesRead){
-            println("all entries in this moof is read")
-            moofsList.removeAt(0)
-
-        }else{
-            val moofParser= MoofParser(reader,requiredMoof.offset,requiredMoof.size)
-            moofParser.getEntries()
-
+        for (moof in moofsList){
+            val moofParse= MoofParser(reader,moof.boxOffset,moof.boxSize)
+            val _entries=moofParse.getEntries(10)
+            println("New mooof")
+            for (samp in _entries){
+                println("Sample Offset: ${samp.frameAbsOffset}  Size: ${samp.frameSize}  Keyframe: ${samp.isSyncSample}")
+            }
         }
 
-        return _entries
+        return entries
     }
 
 
 
+
 }
+
+
+
+/*fun getSamples(initialChunk: Boolean): List<TrunSampleEntry> {
+        val entries = mutableListOf<TrunSampleEntry>()
+        val targetSamples = if (initialChunk) 2 else 6
+
+        if (moofsList.isEmpty()) {
+            println("read all moofs")
+            return entries
+        } else {
+            if (currentMoofBox == null) {
+                val requiredMoof = moofsList[0]
+                currentMoofBox = MoofParser(reader, requiredMoof.boxOffset, requiredMoof.size)
+                val retrievedEntries = currentMoofBox?.getEntries(targetSamples)
+                if (retrievedEntries != null) {
+                    return retrievedEntries
+                }
+
+            } else {
+                if (currentMoofBox!!.trafs.isEmpty()) {
+                    println("parsed all trafs switching next moof")
+                } else {
+                    val retrievedEntries = currentMoofBox?.getEntries(targetSamples)
+                    if (retrievedEntries != null) {
+                        return retrievedEntries
+                    }
+                }
+            }
+        }
+        return entries
+    }*/
