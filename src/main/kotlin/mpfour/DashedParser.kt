@@ -330,25 +330,26 @@ class DashedParser(file: File,val doLogging: Boolean){
         val entries = mutableListOf<TrunSampleEntry>()
         val targetSamples = if (initialChunk) 2 else 6
         if (currentMoofBox==null){
-            println("current moof is null")
-           if (moofsList.isEmpty()){
-               return entries
-           }else{
-               val moof=moofsList[1]
-               currentMoofBox= MoofParser(reader,moof.boxOffset,moof.boxSize)
-               val _entries= currentMoofBox?.getEntries(targetSamples)
-               if (_entries!=null){
-                   return _entries
-               }
-           }
+            if (moofsList.isEmpty()){
+                return entries
+            }else{
+                val moof=moofsList[0]
+                currentMoofBox= MoofParser(reader,moof.boxOffset,moof.boxSize)
+                val _entries= currentMoofBox?.getEntries(targetSamples)
+                if (_entries!=null){
+                    return _entries
+                }
+            }
         }else{
-            val _entries= currentMoofBox?.getEntries(targetSamples)
-            if (_entries!=null){
+            val _entries= currentMoofBox!!.getEntries(targetSamples)
+            if (_entries.isEmpty()){
+                currentMoofBox=null
+                moofsList.removeAt(0)
+                return getSamples(initialChunk)
+            }else{
                 return _entries
             }
         }
-
-
         return entries
     }
 
@@ -384,6 +385,36 @@ class DashedParser(file: File,val doLogging: Boolean){
                         return retrievedEntries
                     }
                 }
+            }
+        }
+        return entries
+    }*/
+
+
+/*fun getSamples(initialChunk: Boolean): List<TrunSampleEntry> {
+        val entries = mutableListOf<TrunSampleEntry>()
+        val targetSamples = if (initialChunk) 2 else 6
+        if (currentMoofBox==null){
+            if (moofsList.isEmpty()){
+                return entries
+            }else{
+                val moof=moofsList[1]
+                println("starting new moof")
+                currentMoofBox= MoofParser(reader,moof.boxOffset,moof.boxSize)
+                val _entries= currentMoofBox?.getEntries(targetSamples)
+                if (_entries!=null){
+                    println("returning")
+                    return _entries
+                }
+            }
+        }else{
+            val _entries= currentMoofBox!!.getEntries(targetSamples)
+            if (_entries.isEmpty()){
+
+                println("moof ended")
+
+            }else{
+                return _entries
             }
         }
         return entries
