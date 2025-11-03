@@ -21,6 +21,7 @@ class MoofParser(
 
 
     init {
+        reader.seek(offset)
         parseTrafStructure()
     }
     private fun parseTrafStructure(){
@@ -228,10 +229,6 @@ class MoofParser(
         }
         return _entries
     }
-
-
-
-
 }
 
 

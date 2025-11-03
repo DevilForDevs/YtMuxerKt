@@ -329,15 +329,34 @@ class DashedParser(file: File,val doLogging: Boolean){
     fun getSamples(initialChunk: Boolean): List<TrunSampleEntry> {
         val entries = mutableListOf<TrunSampleEntry>()
         val targetSamples = if (initialChunk) 2 else 6
-
-        for (moof in moofsList){
-            val moofParse= MoofParser(reader,moof.boxOffset,moof.boxSize)
-            val _entries=moofParse.getEntries(10)
-            println("New mooof")
-            for (samp in _entries){
-                println("Sample Offset: ${samp.frameAbsOffset}  Size: ${samp.frameSize}  Keyframe: ${samp.isSyncSample}")
+        if (currentMoofBox==null){
+            println("current moof is null")
+           if (moofsList.isEmpty()){
+               return entries
+           }else{
+               val moof=moofsList[0]
+               currentMoofBox= MoofParser(reader,moof.boxOffset,moof.boxSize)
+               val _entries= currentMoofBox?.getEntries(targetSamples)
+               if (_entries!=null){
+                   return _entries
+               }
+           }
+        }else{
+            val _entries= currentMoofBox?.getEntries(targetSamples)
+            if (_entries!=null){
+                return _entries
             }
         }
+        /*for (moof in moofsList){
+            currentMoofBox= MoofParser(reader,moof.boxOffset,moof.boxSize)
+            val _entries= currentMoofBox?.getEntries(3)
+            if (_entries != null) {
+                for (samp in _entries){
+                    println("Sample Offset: ${samp.frameAbsOffset}  Size: ${samp.frameSize}  Keyframe: ${samp.isSyncSample}")
+                }
+            }
+        }*/
+
 
         return entries
     }
