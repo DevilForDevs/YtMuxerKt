@@ -15,100 +15,111 @@ class MoofParser(
     private val offset: Long,
     private val size: Long
 ) {
+    private val trafs: List<TrafBox>
+    private val mdatOffset: Long = offset + size + 8
 
-    val mdatOffset=offset+size+8
-    val trafs=mutableListOf<TrafBox>()
-
+    // Cursor state — safe to cache across calls
+    private var trafIndex = 0
+    private var trunIndex = 0
+    private var sampleInTrun = 0
 
     init {
         reader.seek(offset)
-        parseTrafStructure()
+        trafs = parseTrafStructure()
     }
-    private fun parseTrafStructure(){
+
+    private fun parseTrafStructure(): List<TrafBox> {
+        val result = mutableListOf<TrafBox>()
         var innerOffset = offset
-        val trafEnd = offset + size
-        while (innerOffset + 8 <= trafEnd) {
+        val end = offset + size
+
+        while (innerOffset + 8 <= end) {
             reader.seek(innerOffset)
             val header = ByteArray(8)
             reader.readFully(header)
 
-            val size = ByteBuffer.wrap(header, 0, 4)
-                .order(ByteOrder.BIG_ENDIAN)
-                .int.toLong()
+            val boxSize = ByteBuffer.wrap(header, 0, 4).order(ByteOrder.BIG_ENDIAN).int.toLong()
             val type = String(header, 4, 4, Charsets.US_ASCII)
 
-            // safety: if size=0 or invalid, stop
-            if (size <= 0 || innerOffset + size > trafEnd) break
-
+            if (boxSize <= 0 || innerOffset + boxSize > end) break
 
             when (type) {
-                "mfhd" -> {
-                    //it contains sequence/index/postiotn of this moof (optional)
-                }
                 "traf" -> {
-                    trafParser(innerOffset + 8, size - 8)
-                }
-                else -> {
-                    // Unhandled sub-box; skip it
+                    val traf = parseTraf(innerOffset + 8, boxSize - 8)
+                    if (traf != null) result.add(traf)
                 }
             }
-
-            innerOffset += size
+            innerOffset += boxSize
         }
+        return result
     }
-    private fun trafParser(trafOffset: Long, trafSize: Long) {
+
+    private fun parseTraf(trafOffset: Long, trafSize: Long): TrafBox? {
         var innerOffset = trafOffset
-        val trafEnd = trafOffset + trafSize
+        val end = trafOffset + trafSize
 
-        var tfhdBox: TfhdBox?=null
-        var tfdt: TfdtBox?=null
-        val truns=mutableListOf<TrunBox>()
+        var tfhdBox: TfhdBox? = null
+        var tfdtBox: TfdtBox? = null
+        val truns = mutableListOf<TrunBox>()
 
-        while (innerOffset + 8 <= trafEnd) {
+        while (innerOffset + 8 <= end) {
             reader.seek(innerOffset)
             val header = ByteArray(8)
             reader.readFully(header)
 
-            val size = ByteBuffer.wrap(header, 0, 4)
-                .order(ByteOrder.BIG_ENDIAN)
-                .int.toLong()
+            val boxSize = ByteBuffer.wrap(header, 0, 4).order(ByteOrder.BIG_ENDIAN).int.toLong()
             val type = String(header, 4, 4, Charsets.US_ASCII)
 
-            if (size <= 0 || innerOffset + size > trafEnd) break
+            if (boxSize <= 0 || innerOffset + boxSize > end) break
 
             when (type) {
-                "tfhd" -> tfhdBox = parseTfhd(reader,innerOffset,100L)
-                "tfdt" -> tfdt = parseTfdt(reader,innerOffset, size)
-                "trun" ->{
-                    val trun=parseTrun(innerOffset, size)
-                    truns.add(trun)
-                }
-                else   ->{
-                    //unknown box
+                "tfhd" -> tfhdBox = parseTfhd(innerOffset + 8, boxSize - 8)
+                "tfdt" -> tfdtBox = parseTfdt(innerOffset + 8, boxSize - 8)
+                "trun" -> {
+                    val trun = parseTrun(innerOffset, boxSize)
+                    if (trun != null) truns.add(trun)
                 }
             }
-
-            innerOffset += size
+            innerOffset += boxSize
         }
-        trafs.add(
-            TrafBox(
-                truns = truns,
-                tfhdBox = tfhdBox!!,
-                tfdtBox = tfdt!!
-            )
+
+        return if (tfhdBox != null && tfdtBox != null) {
+            TrafBox(truns, tfhdBox, tfdtBox)
+        } else null
+    }
+
+    private fun parseTfhd(offset: Long, size: Long): TfhdBox {
+        reader.seek(offset)
+        val flags = (reader.readUInt8() shl 16) or (reader.readUInt8() shl 8) or reader.readUInt8()
+        val trackId = reader.readInt()
+
+        var baseDataOffset: Long? = null
+        var sampleDescriptionIndex: Int? = null
+
+        if (flags and 0x000001 != 0) baseDataOffset = reader.readLong()
+        if (flags and 0x000002 != 0) sampleDescriptionIndex = reader.readInt()
+
+        return TfhdBox(trackId, baseDataOffset?.toInt() ?: -1, sampleDescriptionIndex?.toInt() ?: -1)
+    }
+
+    private fun parseTfdt(offset: Long, size: Long): TfdtBox {
+        reader.seek(offset)
+        val version = reader.readUInt8()
+        reader.skipBytes(3) // flags
+        val time = if (version == 1) reader.readLong() else reader.readInt().toLong()
+        return TfdtBox(
+            flags = -1,
+            baseMediaDecodeTime = time,
+            version = 1
         )
     }
-    private fun parseTrun(offset: Long, size: Long): TrunBox {
-        // offset is start of box (size + type). Skip header (8 bytes).
-        reader.seek(offset + 8)
+
+    private fun parseTrun(boxOffset: Long, boxSize: Long): TrunBox? {
+        reader.seek(boxOffset + 8)
 
         val version = reader.readUInt8()
-        val flags = (reader.readUInt8() shl 16) or
-                (reader.readUInt8() shl 8) or
-                reader.readUInt8()
-
-        // sample_count is uint32
-        val sampleCount = reader.readUInt32().toInt() // keep as Int for iteration, but validate below
+        val flags = (reader.readUInt8() shl 16) or (reader.readUInt8() shl 8) or reader.readUInt8()
+        val sampleCount = reader.readUInt32().toInt()
 
         var dataOffset: Int? = null
         var firstSampleFlags: Int? = null
@@ -117,8 +128,35 @@ class MoofParser(
         if (flags and 0x000004 != 0) firstSampleFlags = reader.readInt()
 
         val entriesStart = reader.filePointer
-        // entriesLength is the payload left for entries inside this trun box
-        val entriesLength = size - (entriesStart - offset)
+        val hasSize = (flags and 0x000200) != 0
+        val perSampleBytes = (if (flags and 0x000100 != 0) 4 else 0) +
+                (if (hasSize) 4 else 0) +
+                (if (flags and 0x000400 != 0) 4 else 0) +
+                (if (flags and 0x000800 != 0) 4 else 0)
+
+        var sampleSizes: IntArray? = null
+        var cumulativeSizes: LongArray? = null
+
+        if (hasSize && sampleCount > 0) {
+            val sizes = IntArray(sampleCount)
+            var pos = entriesStart
+
+            reader.seek(pos)
+            for (i in 0 until sampleCount) {
+                if (flags and 0x000100 != 0) reader.skipBytes(4)
+                sizes[i] = reader.readInt()
+                if (flags and 0x000400 != 0) reader.skipBytes(4)
+                if (flags and 0x000800 != 0) reader.skipBytes(4)
+            }
+
+            val cum = LongArray(sampleCount + 1)
+            var sum = 0L
+            for (i in 0 until sampleCount) {
+                cum[i + 1] = cum[i] + sizes[i]
+            }
+            sampleSizes = sizes
+            cumulativeSizes = cum
+        }
 
         return TrunBox(
             version = version,
@@ -127,107 +165,97 @@ class MoofParser(
             dataOffset = dataOffset,
             firstSampleFlags = firstSampleFlags,
             entriesOffset = entriesStart,
-            trunEndOffset = size+offset,
-            sampleOffset = mdatOffset
+            sampleOffsetBase = mdatOffset,
+            sampleSizes = sampleSizes,
+            cumulativeSizes = cumulativeSizes
         )
     }
 
     fun getEntries(requiredSamples: Int): List<TrunSampleEntry> {
-        val _entries = mutableListOf<TrunSampleEntry>()
+        val entries = mutableListOf<TrunSampleEntry>()
+        var remaining = requiredSamples
 
-        // If no trafs left, nothing to do
-        if (trafs.isEmpty()) return _entries
+        while (remaining > 0 && trafIndex < trafs.size) {
+            val traf = trafs[trafIndex]
+            if (trunIndex >= traf.truns.size) {
+                trafIndex++
+                trunIndex = 0
+                sampleInTrun = 0
+                continue
+            }
 
-        val traf = trafs[0]
+            val trun = traf.truns[trunIndex]
+            val samplesLeft = trun.totalSampleCount - sampleInTrun
+            if (samplesLeft <= 0) {
+                trunIndex++
+                sampleInTrun = 0
+                continue
+            }
 
-        // If current traf is empty (all truns consumed), remove and continue
-        if (traf.truns.isEmpty()) {
-            trafs.removeAt(0)
+            val take = minOf(remaining, samplesLeft)
+            val parsed = readTrunSamples(trun, sampleInTrun, take)
+            entries.addAll(parsed)
 
-            // Recurse if there are still trafs remaining
-            return if (trafs.isNotEmpty()) {
-                _entries += getEntries(requiredSamples)
-                _entries
-            } else {
-                _entries
+            sampleInTrun += take
+            remaining -= take
+
+            if (sampleInTrun >= trun.totalSampleCount) {
+                trunIndex++
+                sampleInTrun = 0
             }
         }
 
-        // Otherwise, parse from the first trun in this traf
-        val parsedEntries = getTrunEntries(traf, requiredSamples)
-        _entries += parsedEntries
-
-        // If this traf got exhausted (its truns list now empty), move to next traf
-        if (traf.truns.isEmpty()) {
-            trafs.removeAt(0)
-            if (trafs.isNotEmpty()) {
-                _entries += getEntries(requiredSamples)
-            }
-        }
-
-        return _entries
+        return entries
     }
 
-    fun getTrunEntries(trafBox: TrafBox, requiredSamples: Int): List<TrunSampleEntry> {
-        if (trafBox.truns.isEmpty()) return emptyList()
-        val trun = trafBox.truns[0]
-        val _entries = mutableListOf<TrunSampleEntry>()
+    private fun readTrunSamples(trun: TrunBox, startSample: Int, count: Int): List<TrunSampleEntry> {
+        val entries = mutableListOf<TrunSampleEntry>()
 
-        // Move to last saved read position
-        reader.seek(trun.entriesOffset)
+        val hasDuration = (trun.flags and 0x000100) != 0
+        val hasSize = (trun.flags and 0x000200) != 0
+        val hasFlags = (trun.flags and 0x000400) != 0
+        val hasCTO = (trun.flags and 0x000800) != 0
 
-        val hasSampleDuration = (trun.flags and 0x000100) != 0
-        val hasSampleSize = (trun.flags and 0x000200) != 0
-        val hasSampleFlags = (trun.flags and 0x000400) != 0
-        val hasSampleCTO = (trun.flags and 0x000800) != 0
+        val perSampleBytes = (if (hasDuration) 4 else 0) +
+                (if (hasSize) 4 else 0) +
+                (if (hasFlags) 4 else 0) +
+                (if (hasCTO) 4 else 0)
 
-        var perSampleBytes = 0
-        if (hasSampleDuration) perSampleBytes += 4
-        if (hasSampleSize) perSampleBytes += 4
-        if (hasSampleFlags) perSampleBytes += 4
-        if (hasSampleCTO) perSampleBytes += 4
+        val byteOffset = trun.entriesOffset + (startSample * perSampleBytes).toLong()
+        reader.seek(byteOffset)
 
-        val maxPossibleSamples =
-            if (perSampleBytes > 0) ((trun.trunEndOffset - trun.entriesOffset) / perSampleBytes).toInt()
-            else Int.MAX_VALUE
-
-
-        var sampleStart = trun.sampleOffset
-        var samplesRead = 0
-        while (samplesRead < requiredSamples) {
-            val sampleDuration = if (hasSampleDuration) reader.readInt() else null
-            val sampleSize = if (hasSampleSize) reader.readInt() else null
-            val sampleFlags = if (hasSampleFlags) reader.readInt() else null
-            val sampleCTO = if (hasSampleCTO) {
-                if (trun.version == 0) reader.readInt().toLong()
-                else reader.readInt().toLong()
-            } else null
-
-            val isSync = sampleFlags?.let { (it and 0x00010000) == 0 } ?: true
-
-            _entries.add(
-                TrunSampleEntry(
-                    frameSize = sampleSize ?: 0,
-                    frameAbsOffset = sampleStart,
-                    duration = sampleDuration ?: 0,
-                    flags = sampleFlags ?: 0,
-                    compositionTimeOffset = sampleCTO?.toInt() ?: 0,
-                    isSyncSample = isSync
-                )
-            )
-
-
-            if (sampleSize != null) sampleStart += sampleSize
-            samplesRead++
+        var sampleStart = trun.sampleOffsetBase
+        if (startSample > 0 && trun.cumulativeSizes != null) {
+            sampleStart += trun.cumulativeSizes[startSample]
         }
-        // Save updated read positions for next call
-        trun.sampleOffset = sampleStart
-        trun.entriesOffset += samplesRead * perSampleBytes
-        if (reader.filePointer==trun.trunEndOffset){
-            trafBox.truns.removeAt(0)
 
+        repeat(count) { i ->
+            val duration = if (hasDuration) reader.readInt() else 0
+            val size = if (hasSize) reader.readInt() else trun.sampleSizes?.get(startSample + i) ?: 0
+            val flags = if (hasFlags) reader.readInt() else 0
+            val cto = if (hasCTO) reader.readInt().toLong() else 0L
+
+            val isSync = flags and 0x00010000 == 0
+
+            entries.add(TrunSampleEntry(
+                frameSize = size,
+                frameAbsOffset = sampleStart,
+                duration = duration,
+                flags = flags,
+                compositionTimeOffset = cto.toInt(),
+                isSyncSample = isSync
+            ))
+
+            sampleStart += size
         }
-        return _entries
+
+        return entries
+    }
+
+    fun reset() {
+        trafIndex = 0
+        trunIndex = 0
+        sampleInTrun = 0
     }
 }
 

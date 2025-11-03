@@ -334,7 +334,7 @@ class DashedParser(file: File,val doLogging: Boolean){
            if (moofsList.isEmpty()){
                return entries
            }else{
-               val moof=moofsList[0]
+               val moof=moofsList[1]
                currentMoofBox= MoofParser(reader,moof.boxOffset,moof.boxSize)
                val _entries= currentMoofBox?.getEntries(targetSamples)
                if (_entries!=null){
@@ -347,15 +347,6 @@ class DashedParser(file: File,val doLogging: Boolean){
                 return _entries
             }
         }
-        /*for (moof in moofsList){
-            currentMoofBox= MoofParser(reader,moof.boxOffset,moof.boxSize)
-            val _entries= currentMoofBox?.getEntries(3)
-            if (_entries != null) {
-                for (samp in _entries){
-                    println("Sample Offset: ${samp.frameAbsOffset}  Size: ${samp.frameSize}  Keyframe: ${samp.isSyncSample}")
-                }
-            }
-        }*/
 
 
         return entries
