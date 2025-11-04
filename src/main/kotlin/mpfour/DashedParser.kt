@@ -1,8 +1,6 @@
 package mpfour
 import org.ytmuxer.webm.convertBytes
-import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -20,6 +18,9 @@ class DashedParser(file: File,val doLogging: Boolean){
     var language: String = ""
 
     var trackDuration=-1L
+
+    var videoInfo = VideoTrackInfo()
+
 
     // From hdlr
     var handlerType: String = ""
@@ -98,7 +99,7 @@ class DashedParser(file: File,val doLogging: Boolean){
                 "moov" -> {
                     val payload = ByteArray(payloadSize.toInt())
                     reader.readFully(payload)
-                    parseMoov(payload)
+                    parseMoov(payload,doLogging)
                 }
 
                 "moof" -> {
@@ -157,7 +158,7 @@ class DashedParser(file: File,val doLogging: Boolean){
         return totalTrunEntries
     }
 
-    fun parseMoov(payload: ByteArray) {
+    fun parseMoov(payload: ByteArray,doLogging: Boolean) {
         val buffer = ByteBuffer.wrap(payload)
         while (buffer.remaining() >= 8) {
             val boxStart = buffer.position()
@@ -310,21 +311,45 @@ class DashedParser(file: File,val doLogging: Boolean){
             val boxSize = data.int
             val boxType = data.int
 
-            val typeStr = String(
-                ByteBuffer.allocate(4).putInt(boxType).array()
-            )
+            val typeStr = String(ByteBuffer.allocate(4).putInt(boxType).array())
 
             if (typeStr == "stsd") {
-                // Rewind back to box start to capture full box (size + type + content)
+                // Rewind back to start and extract full box
                 data.position(boxStart)
-                stsdBox = ByteArray(boxSize)
-                data.get(stsdBox)
+                val boxData = ByteArray(boxSize)
+                stsdBox=boxData
+                data.get(boxData)
+                videoInfo.stsdBox = boxData
+
+                // Parse width/height from avc1 entry (if exists)
+                val stsdBuffer = ByteBuffer.wrap(boxData).order(ByteOrder.BIG_ENDIAN)
+
+                stsdBuffer.position(16) // skip header (size, type, version/flags, entry_count)
+                if (stsdBuffer.remaining() >= 8) {
+                    val entrySize = stsdBuffer.int
+                    val formatBytes = ByteArray(4)
+                    stsdBuffer.get(formatBytes)
+                    val format = String(formatBytes)
+
+                    if (format == "avc1" || format == "hvc1") {
+                        // Skip reserved + pre_defined + etc. (6 + 2 + 16 bytes)
+                        stsdBuffer.position(stsdBuffer.position() + 6 + 2 + 16)
+                        val width = stsdBuffer.short.toInt() and 0xFFFF
+                        val height = stsdBuffer.short.toInt() and 0xFFFF
+
+                        videoInfo.width = width
+                        videoInfo.height = height
+                        videoInfo.handlerType = "vide"
+                    }
+                }
+
                 break
             }
 
             data.position(boxStart + boxSize)
         }
     }
+
 
     fun getSamples(initialChunk: Boolean): List<TrunSampleEntry> {
         val entries = mutableListOf<TrunSampleEntry>()
@@ -352,70 +377,5 @@ class DashedParser(file: File,val doLogging: Boolean){
         }
         return entries
     }
-
-
-
-
 }
 
-
-
-/*fun getSamples(initialChunk: Boolean): List<TrunSampleEntry> {
-        val entries = mutableListOf<TrunSampleEntry>()
-        val targetSamples = if (initialChunk) 2 else 6
-
-        if (moofsList.isEmpty()) {
-            println("read all moofs")
-            return entries
-        } else {
-            if (currentMoofBox == null) {
-                val requiredMoof = moofsList[0]
-                currentMoofBox = MoofParser(reader, requiredMoof.boxOffset, requiredMoof.size)
-                val retrievedEntries = currentMoofBox?.getEntries(targetSamples)
-                if (retrievedEntries != null) {
-                    return retrievedEntries
-                }
-
-            } else {
-                if (currentMoofBox!!.trafs.isEmpty()) {
-                    println("parsed all trafs switching next moof")
-                } else {
-                    val retrievedEntries = currentMoofBox?.getEntries(targetSamples)
-                    if (retrievedEntries != null) {
-                        return retrievedEntries
-                    }
-                }
-            }
-        }
-        return entries
-    }*/
-
-
-/*fun getSamples(initialChunk: Boolean): List<TrunSampleEntry> {
-        val entries = mutableListOf<TrunSampleEntry>()
-        val targetSamples = if (initialChunk) 2 else 6
-        if (currentMoofBox==null){
-            if (moofsList.isEmpty()){
-                return entries
-            }else{
-                val moof=moofsList[1]
-                println("starting new moof")
-                currentMoofBox= MoofParser(reader,moof.boxOffset,moof.boxSize)
-                val _entries= currentMoofBox?.getEntries(targetSamples)
-                if (_entries!=null){
-                    println("returning")
-                    return _entries
-                }
-            }
-        }else{
-            val _entries= currentMoofBox!!.getEntries(targetSamples)
-            if (_entries.isEmpty()){
-
-                println("moof ended")
-
-            }else{
-                return _entries
-            }
-        }
-        return entries
-    }*/

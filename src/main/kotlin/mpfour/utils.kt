@@ -12,6 +12,13 @@ import java.nio.ByteOrder
 
 
 
+data class VideoTrackInfo(
+    var stsdBox: ByteArray? = null,
+    var width: Int = 0,
+    var height: Int = 0,
+    var handlerType: String = "vide"
+)
+
 data class MoofBox(
     val totalEntries: Int,
     var entriesRead: Int,
@@ -79,15 +86,29 @@ class utils {
         return buffer.array()
     }
     fun writeStco(offsets: List<Long>): ByteArray {
-        val entryCount = offsets.size
-        val buffer = ByteBuffer.allocate(16 + 4 * entryCount).order(ByteOrder.BIG_ENDIAN)
-        buffer.putInt(16 + 4 * entryCount)
-        buffer.put("stco".toByteArray())
-        buffer.putInt(0)                         // version + flags
-        buffer.putInt(entryCount)
-        offsets.forEach { buffer.putInt(it.toInt()) } // Use `.toInt()` if offsets are within 32-bit
-        return buffer.array()
+        val useCo64 = offsets.any { it > 0xFFFFFFFFL }
+        return if (useCo64) {
+            // co64 (64-bit offsets)
+            val entryCount = offsets.size
+            val buffer = ByteBuffer.allocate(16 + 8 * entryCount).order(ByteOrder.BIG_ENDIAN)
+            buffer.putInt(16 + 8 * entryCount)
+            buffer.put("co64".toByteArray())
+            buffer.putInt(0) // version+flags
+            buffer.putInt(entryCount)
+            offsets.forEach { buffer.putLong(it) }
+            buffer.array()
+        } else {
+            val entryCount = offsets.size
+            val buffer = ByteBuffer.allocate(16 + 4 * entryCount).order(ByteOrder.BIG_ENDIAN)
+            buffer.putInt(16 + 4 * entryCount)
+            buffer.put("stco".toByteArray())
+            buffer.putInt(0)
+            buffer.putInt(entryCount)
+            offsets.forEach { buffer.putInt(it.toInt()) }
+            buffer.array()
+        }
     }
+
     fun writeStss(syncSampleIndices: List<Int>): ByteArray {
         val entryCount = syncSampleIndices.size
         val buffer = ByteBuffer.allocate(16 + 4 * entryCount).order(ByteOrder.BIG_ENDIAN)
@@ -151,27 +172,29 @@ class utils {
         box.put(content)
         return box.array()
     }
-    fun writeTkhd(duration: Int): ByteArray {
+
+    fun writeTkhd(trackId: Int, duration: Int, widthPixels: Int = 0, heightPixels: Int = 0): ByteArray {
         val buffer = ByteBuffer.allocate(92).order(ByteOrder.BIG_ENDIAN)
-        buffer.putInt(92)                    // size
-        buffer.put("tkhd".toByteArray())    // type
-        buffer.put(0x00)                    // version
+        buffer.putInt(92)
+        buffer.put("tkhd".toByteArray(Charsets.US_ASCII))
+        buffer.put(0x00) // version
         buffer.put(byteArrayOf(0x00, 0x00, 0x07)) // flags (enabled | in movie | in preview)
 
         val macTime = ((System.currentTimeMillis() / 1000) + 2082844800L).toInt()
-        buffer.putInt(macTime)              // creation_time
-        buffer.putInt(macTime)              // modification_time
-        buffer.putInt(1)              // track_ID
-        buffer.putInt(0)                    // reserved
-        buffer.putInt(duration)             // duration
-        buffer.putInt(0)                    // reserved
-        buffer.putInt(0)                    // reserved
+        buffer.putInt(macTime)           // creation_time
+        buffer.putInt(macTime)           // modification_time
+        buffer.putInt(trackId)           // track_ID  (use unique ID)
+        buffer.putInt(0)                 // reserved
+        buffer.putInt(duration)          // duration
+        buffer.putInt(0)                 // reserved
+        buffer.putInt(0)
 
-        buffer.putShort(0)                  // layer
-        buffer.putShort(0)                  // alternate group
-        buffer.putShort(0x0100)             // volume (0 for video)
-        buffer.putShort(0)                  // reserved
+        buffer.putShort(0)               // layer
+        buffer.putShort(0)               // alternate group
+        buffer.putShort(0x0100.toShort())// volume (1.0) (keep 0 for pure video)
+        buffer.putShort(0)               // reserved
 
+        // Unity matrix (9 * 4 bytes)
         val matrix = listOf(
             0x00010000, 0, 0,
             0, 0x00010000, 0,
@@ -179,11 +202,14 @@ class utils {
         )
         matrix.forEach { buffer.putInt(it) }
 
-        buffer.putInt(0)                    // width (placeholder)
-        buffer.putInt(0)                    // height (placeholder)
+        // width & height are 16.16 fixed point
+        buffer.putInt(widthPixels shl 16)
+        buffer.putInt(heightPixels shl 16)
 
         return buffer.array()
     }
+
+
     fun writeMdhd(timeScale: Int, duration: Int): ByteArray {
         val buffer = ByteBuffer.allocate(32).order(ByteOrder.BIG_ENDIAN)
         buffer.putInt(32)
@@ -248,17 +274,27 @@ class utils {
             put(stblBox)
         }.array()
     }
-    fun writeVmhd(handlerType: String): ByteArray {
-        val buffer = ByteBuffer.allocate(20).order(ByteOrder.BIG_ENDIAN)
-        buffer.putInt(20) // size
-        buffer.put(handlerType.toByteArray())
-        buffer.putInt(0x00000001) // version(1) + flags (graphics mode present)
-        buffer.putShort(0) // graphicsmode
-        buffer.putShort(0) // opcolor R
-        buffer.putShort(0) // opcolor G
-        buffer.putShort(0) // opcolor B
+    fun writeSmhd(): ByteArray {
+        val buffer = ByteBuffer.allocate(16).order(ByteOrder.BIG_ENDIAN)
+        buffer.putInt(16)                       // size
+        buffer.put("smhd".toByteArray())        // box type
+        buffer.putInt(0)                        // version + flags
+        buffer.putShort(0)                      // balance
+        buffer.putShort(0)                      // reserved
         return buffer.array()
     }
+    fun writeVmhd(): ByteArray {
+        val buffer = ByteBuffer.allocate(20).order(ByteOrder.BIG_ENDIAN)
+        buffer.putInt(20)                       // size
+        buffer.put("vmhd".toByteArray())        // box type
+        buffer.putInt(0x00000001)               // version(0) + flags(1) (graphics mode present)
+        buffer.putShort(0)                      // graphicsmode
+        buffer.putShort(0)                      // opcolor R
+        buffer.putShort(0)                      // opcolor G
+        buffer.putShort(0)                      // opcolor B
+        return buffer.array()
+    }
+
     fun writeMoov(mvhd: ByteArray, tracks: MutableList<ByteArray>): ByteArray {
         val totalSize = 8 + mvhd.size + tracks.sumOf { it.size }
         return ByteBuffer.allocate(totalSize).apply {
@@ -269,18 +305,40 @@ class utils {
             tracks.forEach { put(it) }
         }.array()
     }
-    fun writeFtyp(): ByteArray {
-        val brands = arrayOf("isom", "iso2", "mp41", "mp42")
-        val size = 8 + 4 + 4 + brands.size * 4  // header + major_brand + minor_version + compatible brands
+    fun writeFtyp(overrideMainBrand: String? = null): ByteArray {
+        // Define compatible brands (can be adjusted as needed)
+        val compatibleBrands = mutableListOf("mp41", "isom", "iso2")
+
+        // If override brand exists, include mp42 as compatible
+        if (overrideMainBrand != null) {
+            compatibleBrands.add("mp42")
+        }
+
+        // Calculate total size
+        val size = 16 + compatibleBrands.size * 4 +
+                if (overrideMainBrand != null) 4 else 0
 
         return ByteBuffer.allocate(size).apply {
-            putInt(size)                         // size
-            put("ftyp".toByteArray())            // type
-            put("isom".toByteArray())            // major_brand
-            putInt(0x200)                        // minor_version
-            brands.forEach { put(it.toByteArray()) }  // compatible brands
+            putInt(size)
+            put("ftyp".toByteArray(Charsets.US_ASCII))
+
+            if (overrideMainBrand == null) {
+                put("mp42".toByteArray(Charsets.US_ASCII)) // major brand
+                putInt(0x200) // minor version (512)
+            } else {
+                put(overrideMainBrand.toByteArray(Charsets.US_ASCII))
+                putInt(0)
+                // Extra brand for mp42 compatibility
+                put("mp42".toByteArray(Charsets.US_ASCII))
+            }
+
+            // Write compatible brands
+            compatibleBrands.forEach {
+                put(it.toByteArray(Charsets.US_ASCII))
+            }
         }.array()
     }
+
 
 
 }
@@ -513,6 +571,10 @@ fun saveH264Frame(
 
     return outputFile
 }
+
+
+/*ffprobe -v error -show_format -show_streams output.mp4
+*/
 
 
 

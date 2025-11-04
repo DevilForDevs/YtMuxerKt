@@ -146,56 +146,60 @@ class MoofParser(
 
         }
     }
-    fun getTrunEntries(trafBox: TrafBox,rsc: Int): MutableList<TrunSampleEntry> {
-        val trun = trafBox.truns[0]
-        val _entries = mutableListOf<TrunSampleEntry>()
+    fun getTrunEntries(trafBox: TrafBox, rsc: Int): MutableList<TrunSampleEntry> {
+        val trun = trafBox.truns.firstOrNull() ?: return mutableListOf()
+        val entries = mutableListOf<TrunSampleEntry>()
+
         reader.seek(trun.entriesOffset)
+
         val hasSampleDuration = (trun.flags and 0x000100) != 0
         val hasSampleSize = (trun.flags and 0x000200) != 0
         val hasSampleFlags = (trun.flags and 0x000400) != 0
         val hasSampleCTO = (trun.flags and 0x000800) != 0
 
-        for (i in 0 until rsc){
-            val sampleDuration = if (hasSampleDuration) reader.readInt() else null
-            val sampleSize = if (hasSampleSize) reader.readInt() else null
-            val sampleFlags = if (hasSampleFlags) reader.readInt() else null
-            val sampleCTO = if (hasSampleCTO) {
-                if (trun.version == 0) reader.readInt().toLong()
-                else reader.readInt().toLong()
-            } else null
+        val tfhdFlags = trafBox.tfhdBox.flags
+        val hasDefaultDuration = (tfhdFlags and 0x000008) != 0
+        val hasDefaultSize = (tfhdFlags and 0x000010) != 0
+        val hasDefaultFlags = (tfhdFlags and 0x000020) != 0
 
-            val isSync = sampleFlags?.let { (it and 0x00010000) == 0 } ?: true
+        val defaultDuration = if (hasDefaultDuration) trafBox.tfhdBox.defaultSampleDuration else 0
+        val defaultSize = if (hasDefaultSize) trafBox.tfhdBox.defaultSampleSize else 0
+        val defaultFlags = if (hasDefaultFlags) trafBox.tfhdBox.defaultSampleFlags else 0
 
-            _entries.add(
+        for (i in 0 until trun.totalSampleCount) {
+            if (reader.filePointer >= trun.trunEndOffset) break
+
+            val sampleDuration = if (hasSampleDuration) reader.readInt() else defaultDuration
+            val sampleSize = if (hasSampleSize) reader.readInt() else defaultSize
+            val sampleFlags = if (hasSampleFlags) reader.readInt() else defaultFlags
+            val sampleCTO = if (hasSampleCTO) reader.readInt().toLong() else 0L
+
+            val isSync = (sampleFlags?.and(0x00010000)) == 0
+
+            entries.add(
                 TrunSampleEntry(
-                    frameSize = sampleSize ?: 0,
+                    frameSize = sampleSize!!,
                     frameAbsOffset = trun.sampleOffset,
-                    duration = sampleDuration ?: 0,
-                    flags = sampleFlags ?: 0,
-                    compositionTimeOffset = sampleCTO?.toInt() ?: 0,
+                    duration = sampleDuration,
+                    flags = sampleFlags,
+                    compositionTimeOffset = sampleCTO.toInt(),
                     isSyncSample = isSync
                 )
             )
 
-            if (sampleSize!=null){
-                trun.sampleOffset+=sampleSize
-            }
-            val position=reader.filePointer
-            if (trun.trunEndOffset==position){
+            trun.sampleOffset += sampleSize
+            val pos = reader.filePointer
+
+            if (pos >= trun.trunEndOffset) {
                 trafBox.truns.removeAt(0)
                 break
-            }else{
-                trun.entriesOffset=position
-
+            } else {
+                trun.entriesOffset = pos
             }
         }
-        return _entries
+
+        return entries
     }
-
-
-
-
-
 
 }
 
