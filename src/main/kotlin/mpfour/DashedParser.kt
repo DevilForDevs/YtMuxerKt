@@ -2,16 +2,14 @@ package mpfour
 import org.ytmuxer.webm.convertBytes
 import java.io.File
 import java.io.RandomAccessFile
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 
 
 class DashedParser(file: File,val doLogging: Boolean){
     val reader= RandomAccessFile(file,"r")
-    var movieTimescale: Int = -1
-    var movieDuration: Long = -1
-    val ATOM_TKHD: Int = 0x746B6864
-    var ATOM_MDIA: Int = 0x6D646961
+
+    //========moov boxex===========
+    var mvhd: Mvhd?=null
+
 
     var mediaTimescale: Int = -1
     var mediaDuration: Long = -1
@@ -76,7 +74,6 @@ class DashedParser(file: File,val doLogging: Boolean){
         // --- Main parsing loop ---
         while (reader.filePointer + 8 <= reader.length()) {
             val startOffsetLoop = reader.filePointer
-
             val sizeLoop = reader.readInt().toLong()
             if (sizeLoop < 8) {
                 throw IllegalStateException("Invalid box size $sizeLoop at offset $startOffsetLoop")
@@ -84,7 +81,6 @@ class DashedParser(file: File,val doLogging: Boolean){
 
             val typeBytesLoop = ByteArray(4).also { reader.readFully(it) }
             val boxTypeLoop = String(typeBytesLoop, Charsets.US_ASCII)
-
             val payloadOffset = reader.filePointer
             val payloadSize = sizeLoop - 8
 
@@ -97,22 +93,23 @@ class DashedParser(file: File,val doLogging: Boolean){
 
             when (boxTypeLoop) {
                 "moov" -> {
-                    val payload = ByteArray(payloadSize.toInt())
-                    reader.readFully(payload)
-                    parseMoov(payload,doLogging)
+                    parseMoov(payloadOffset,payloadSize)  //moves fwd
+                    reader.seek(payloadOffset + payloadSize)   //🟡 important line moves backward
                 }
 
                 "moof" -> {
-                    val payload = ByteArray(payloadSize.toInt())
-                    reader.readFully(payload)
-                    val entriesInThisMoof=countEntriesInMoof(payload)
-                    trunEntries+=entriesInThisMoof
-                    moofsList.add(MoofBox(
-                        boxOffset = payloadOffset,
-                        boxSize = payloadSize,
-                        totalEntries = entriesInThisMoof,
-                        entriesRead = 0
-                    ))
+                    val entriesInThisMoof = countEntriesInMoof(reader,payloadOffset, payloadSize)
+                    trunEntries += entriesInThisMoof
+                    moofsList.add(
+                        MoofBox(
+                            boxOffset = payloadOffset,
+                            boxSize = payloadSize,
+                            totalEntries = entriesInThisMoof,
+                            entriesRead = 0
+                        )
+                    )
+                    // Move reader to end of moof
+                    reader.seek(payloadOffset + payloadSize) //🟡 important line pointer moves backward
                 }
 
                 else -> {
@@ -123,231 +120,314 @@ class DashedParser(file: File,val doLogging: Boolean){
         }
     }
 
-    fun countEntriesInMoof(moofData: ByteArray): Int {
-        val buffer = ByteBuffer.wrap(moofData).order(ByteOrder.BIG_ENDIAN)
-        var totalTrunEntries = 0
+    fun parseMoov(moovOffset: Long, moovSize: Long) {
+        reader.seek(moovOffset)
+        val moovEnd = moovOffset + moovSize
+        while (reader.filePointer + 8 <= moovEnd) {
+            val boxStart = reader.filePointer
+            val size = reader.readInt().toLong()
+            val typeBytes = ByteArray(4).also { reader.readFully(it) }
+            val type = String(typeBytes, Charsets.US_ASCII)
+            val payloadOffset = reader.filePointer
+            val payloadSize = size - 8
 
-        while (buffer.remaining() >= 8) {
-            val startPos = buffer.position()
-            val size = buffer.int
-            val type = String(ByteArray(4).also { buffer.get(it) })
+            if (size < 8 || boxStart + size > moovEnd) {
+                if (doLogging) println("Invalid sub-box in moov: $type at offset=$boxStart size=$size")
+                break
+            }
+            if (doLogging){
+                println(
+                    "Box: $type | BoxOffset: $payloadOffset | BoxSize: $payloadSize | " +
+                            "PayloadOffset: $payloadOffset | PayloadSize: ${convertBytes(payloadSize)}"
+                )
+            }
 
-            if (type == "traf") {
-                val trafEnd = startPos + size
-                while (buffer.position() < trafEnd && buffer.remaining() >= 8) {
-                    val boxStart = buffer.position()
-                    val subSize = buffer.int
-                    val subType = String(ByteArray(4).also { buffer.get(it) })
-
-                    if (subType == "trun") {
-                        if (subSize >= 12 && buffer.remaining() >= 8) {
-                            buffer.position(buffer.position() + 4) // skip version & flags
-                            val entryCount = buffer.int
-                            totalTrunEntries += entryCount
-                        }
-                        buffer.position(boxStart + subSize)
-                    } else {
-                        buffer.position(boxStart + subSize)
-                    }
+            when (type) {
+                "trak" -> {
+                    parseTrak(payloadOffset,payloadSize)
+                    reader.seek(payloadOffset + payloadSize)  //🟡 important line pointer moves backward
                 }
-            } else {
-                buffer.position(startPos + size)
-            }
-        }
-
-        return totalTrunEntries
-    }
-
-    fun parseMoov(payload: ByteArray,doLogging: Boolean) {
-        val buffer = ByteBuffer.wrap(payload)
-        while (buffer.remaining() >= 8) {
-            val boxStart = buffer.position()
-            val boxSize = buffer.int
-            val boxType = buffer.int
-
-            when (boxType) {
-                0x6D766864 -> parseMvhd(buffer.slice().limit(boxSize - 8) as ByteBuffer) // "mvhd"
-                0x7472616B -> parseTrak(buffer.slice().limit(boxSize - 8) as ByteBuffer) // "trak"
-            }
-            buffer.position(boxStart + boxSize)
-        }
-    }
-
-    fun parseMvhd(buffer: ByteBuffer) {
-
-        val version = buffer.get().toInt()
-        buffer.get() // flags
-        buffer.get()
-        buffer.get()
-        if (version == 1) {
-            buffer.long // creation_time
-            buffer.long // modification_time
-            movieTimescale = buffer.int
-            movieDuration = buffer.long
-
-        } else {
-            buffer.int
-            buffer.int
-            movieTimescale = buffer.int
-            movieDuration = buffer.int.toLong()
-        }
-
-
-        buffer.int // rate
-        buffer.short // volume
-        buffer.position(buffer.position() + 10 + 36 + 24) // skip reserved/matrix
-    }
-    fun parseTrak(data: ByteBuffer) {
-        while (data.remaining() >= 8) {
-            val boxStart = data.position()
-            val boxSize = data.int
-            val boxType = data.int
-
-            when (boxType) {
-                ATOM_MDIA -> parseMdia(data.slice().limit(boxSize - 8) as ByteBuffer) // "mdia"
-                ATOM_TKHD->parseTkhd(data.slice().limit(boxSize - 8) as ByteBuffer)//tkhd
-            }
-            data.position(boxStart + boxSize)
-        }
-    }
-    fun parseTkhd(data: ByteBuffer) {
-        data.order(ByteOrder.BIG_ENDIAN)
-        val version = data.get().toInt() and 0xFF
-        val flags = (data.get().toInt() and 0xFF shl 16) or
-                (data.get().toInt() and 0xFF shl 8) or
-                (data.get().toInt() and 0xFF)
-
-        val startPos = data.position()
-
-        val trackId: Int
-        if (version == 1) {
-            if (data.remaining() < 32) return  // Avoid overflow
-            data.position(data.position() + 16) // creation + modification (8+8)
-            trackId = data.int
-            data.int // reserved
-            trackDuration = data.long
-        } else {
-            if (data.remaining() < 20) return
-            data.position(data.position() + 8) // creation + modification (4+4)
-            trackId = data.int
-            data.int // reserved
-            trackDuration = data.int.toLong() and 0xFFFFFFFF
-        }
-
-        // Safely skip rest if remaining bytes exist
-        val skipBytes = 8 + 2 + 2 + 2 + 2 + 36 + 4 + 4
-        if (data.remaining() >= skipBytes) {
-            data.position(data.position() + skipBytes)
-        } else {
-            // Avoid buffer overflow
-            data.position(data.limit())
-        }
-
-        /* println("🎯 trackId=$trackId, duration=$trackDuration")*/
-    }
-
-    fun parseMdia(data: ByteBuffer) {
-        while (data.remaining() >= 8) {
-            val boxStart = data.position()
-            val boxSize = data.int
-            val boxType = data.int
-
-            when (boxType) {
-                0x6D646864 -> parseMdhd(data.slice().limit(boxSize - 8) as ByteBuffer) // "mdhd"
-                0x68646C72 -> parseHdlr(data.slice().limit(boxSize - 8) as ByteBuffer) // "hdlr"
-                0x6D696E66 -> parseMinf(data.slice().limit(boxSize - 8) as ByteBuffer) // "minf"
-            }
-            data.position(boxStart + boxSize)
-        }
-    }
-    fun parseMdhd(buffer: ByteBuffer) {
-        val version = buffer.get().toInt()
-        buffer.position(buffer.position() + 3) // skip flags
-
-        if (version == 1) {
-            buffer.long
-            buffer.long
-            mediaTimescale = buffer.int
-            mediaDuration = buffer.long
-        } else {
-            buffer.int
-            buffer.int
-            mediaTimescale = buffer.int
-            mediaDuration = buffer.int.toLong()
-        }
-
-        val lang = buffer.short
-        language = decodeLanguage(lang)
-    }
-    fun decodeLanguage(code: Short): String {
-        return listOf(
-            ((code.toInt() shr 10) and 0x1F) + 0x60,
-            ((code.toInt() shr 5) and 0x1F) + 0x60,
-            (code.toInt() and 0x1F) + 0x60
-        ).joinToString("") { it.toChar().toString() }
-    }
-    fun parseHdlr(buffer: ByteBuffer) {
-        buffer.position(buffer.position() + 4) // version + flags
-        buffer.int // pre_defined
-        val handler = ByteArray(4)
-        buffer.get(handler)
-        handlerType = String(handler, Charsets.US_ASCII)
-    }
-    fun parseMinf(data: ByteBuffer) {
-        while (data.remaining() >= 8) {
-            val boxStart = data.position()
-            val boxSize = data.int
-            val boxType = data.int
-
-            if (boxType == 0x7374626C) { // "stbl"
-                parseStbl(data.slice().limit(boxSize - 8) as ByteBuffer)
-            }
-            data.position(boxStart + boxSize)
-        }
-    }
-    fun parseStbl(data: ByteBuffer) {
-        while (data.remaining() >= 8) {
-            val boxStart = data.position()
-            val boxSize = data.int
-            val boxType = data.int
-
-            val typeStr = String(ByteBuffer.allocate(4).putInt(boxType).array())
-
-            if (typeStr == "stsd") {
-                // Rewind back to start and extract full box
-                data.position(boxStart)
-                val boxData = ByteArray(boxSize)
-                stsdBox=boxData
-                data.get(boxData)
-                videoInfo.stsdBox = boxData
-
-                // Parse width/height from avc1 entry (if exists)
-                val stsdBuffer = ByteBuffer.wrap(boxData).order(ByteOrder.BIG_ENDIAN)
-
-                stsdBuffer.position(16) // skip header (size, type, version/flags, entry_count)
-                if (stsdBuffer.remaining() >= 8) {
-                    val entrySize = stsdBuffer.int
-                    val formatBytes = ByteArray(4)
-                    stsdBuffer.get(formatBytes)
-                    val format = String(formatBytes)
-
-                    if (format == "avc1" || format == "hvc1") {
-                        // Skip reserved + pre_defined + etc. (6 + 2 + 16 bytes)
-                        stsdBuffer.position(stsdBuffer.position() + 6 + 2 + 16)
-                        val width = stsdBuffer.short.toInt() and 0xFFFF
-                        val height = stsdBuffer.short.toInt() and 0xFFFF
-
-                        videoInfo.width = width
-                        videoInfo.height = height
-                        videoInfo.handlerType = "vide"
-                    }
+                "mvhd" -> {
+                     mvhd=parseMvhd(reader,payloadOffset)
+                     reader.seek(payloadOffset + payloadSize)  //🟡 important line pointer moves backward
                 }
+                else -> {
+                    // Skip unknown box
+                    reader.seek(payloadOffset + payloadSize)
+                }
+            }
+        }
+    }
 
+    fun parseTrak(trakOffset: Long, trakSize: Long) {
+        reader.seek(trakOffset)
+        val trakEnd = trakOffset + trakSize
+
+        while (reader.filePointer + 8 <= trakEnd) {
+            val boxStart = reader.filePointer
+            val size = reader.readInt().toLong()
+            val typeBytes = ByteArray(4).also { reader.readFully(it) }
+            val type = String(typeBytes, Charsets.US_ASCII)
+            val payloadOffset = reader.filePointer
+            val payloadSize = size - 8
+
+            if (size < 8 || boxStart + size > trakEnd) {
+                if (doLogging) println("⚠ Invalid sub-box in trak: $type at offset=$boxStart size=$size")
                 break
             }
 
-            data.position(boxStart + boxSize)
+            if (doLogging){
+                println(
+                    "Box: $type | BoxOffset: $payloadOffset | BoxSize: $payloadSize | " +
+                            "PayloadOffset: $payloadOffset | PayloadSize: ${convertBytes(payloadSize)}"
+                )
+            }
+
+            when (type) {
+                "tkhd" -> {
+                    parseTkhd(reader,payloadOffset)
+                    reader.seek(payloadOffset + payloadSize)  //🟡 important line pointer moves backward
+                }
+                "mdia" -> {
+                    parseMdia(payloadOffset,payloadSize)
+                    reader.seek(payloadOffset + payloadSize)
+                }
+                "edts"->{
+                    parseEdts(reader,doLogging,payloadOffset,payloadSize)
+                    reader.seek(payloadOffset + payloadSize)   //🟡 important line pointer moves backward
+                }
+                else -> {
+                    // Skip unrecognized boxes
+                    reader.seek(payloadOffset + payloadSize)
+                }
+            }
         }
+    }
+
+    fun parseMdia(offset: Long, size: Long) {
+        val mdiaEnd = offset + size
+        reader.seek(offset)
+
+        while (reader.filePointer + 8 <= mdiaEnd) {
+            val start = reader.filePointer
+            val boxSize = reader.readInt().toLong()
+            val typeBytes = ByteArray(4).also { reader.readFully(it) }
+            val type = String(typeBytes, Charsets.US_ASCII)
+            val payloadOffset = reader.filePointer
+            val payloadSize = boxSize - 8
+
+            if (doLogging){
+                println(
+                    "Box: $type | BoxOffset: $payloadOffset | BoxSize: $payloadSize | " +
+                            "PayloadOffset: $payloadOffset | PayloadSize: ${convertBytes(payloadSize)}"
+                )
+            }
+
+            when (type) {
+                "minf" -> {
+                    parseMinf(payloadOffset, payloadSize)  //currently ignore this
+                    reader.seek(payloadOffset + payloadSize)
+                }
+                "mdhd"->{
+                    parseMdhd(reader,payloadOffset)
+                    reader.seek(payloadOffset + payloadSize)
+                }
+                "hdlr"->{
+                    parseHdlr(reader,payloadOffset,payloadSize)
+                    reader.seek(payloadOffset + payloadSize)
+                }
+                else -> reader.seek(payloadOffset + payloadSize)
+            }
+        }
+    }
+
+    fun parseMinf(offset: Long, size: Long) {
+        val minfEnd = offset + size
+        reader.seek(offset)
+
+        while (reader.filePointer + 8 <= minfEnd) {
+            val start = reader.filePointer
+            val boxSize = reader.readInt().toLong()
+            val typeBytes = ByteArray(4).also { reader.readFully(it) }
+            val type = String(typeBytes, Charsets.US_ASCII)
+            val payloadOffset = reader.filePointer
+            val payloadSize = boxSize - 8
+
+            if (doLogging){
+                println(
+                    "Box: $type | BoxOffset: $payloadOffset | BoxSize: $payloadSize | " +
+                            "PayloadOffset: $payloadOffset | PayloadSize: ${convertBytes(payloadSize)}"
+                )
+            }
+
+            when (type) {
+                "vmhd" -> {
+                    val vmhd = parseVmhd(reader, payloadOffset)
+                    reader.seek(payloadOffset + payloadSize)
+                }
+                "smhd" -> {
+                    val smhd = parseSmhd(reader, payloadOffset)
+                    reader.seek(payloadOffset + payloadSize)
+                }
+                "dinf" -> {
+                    val dinf = parseDinf(reader, payloadOffset, payloadSize)
+                    reader.seek(payloadOffset + payloadSize)
+                }
+                "stbl" -> {
+                    parseStbl(payloadOffset,payloadSize)
+                    reader.seek(payloadOffset + payloadSize)
+                }
+                else -> reader.seek(payloadOffset + payloadSize)
+            }
+
+        }
+    }
+
+    fun parseStbl(offset: Long, size: Long){
+        val stblEnd = offset + size
+        reader.seek(offset)
+
+        while (reader.filePointer + 8 <= stblEnd) {
+            val boxStart = reader.filePointer
+            val boxSize = reader.readInt().toLong()
+            val typeBytes = ByteArray(4).also { reader.readFully(it) }
+            val type = String(typeBytes, Charsets.US_ASCII)
+            val payloadOffset = reader.filePointer
+            val payloadSize = boxSize - 8
+
+            if (doLogging) {
+                if (doLogging){
+                    println(
+                        "Box: $type | BoxOffset: $payloadOffset | BoxSize: $payloadSize | " +
+                                "PayloadOffset: $payloadOffset | PayloadSize: ${convertBytes(payloadSize)}"
+                    )
+                }
+            }
+
+            when (type) {
+                "stsd" -> {
+                    parseStsd(boxStart,boxSize)
+                    reader.seek(boxStart + boxSize)
+                }
+                "stts" -> {
+                    reader.seek(boxStart + boxSize)
+                }
+                "stsc" -> {
+                    reader.seek(boxStart + boxSize)
+                }
+                "stsz", "stz2" -> {
+                    reader.seek(boxStart + boxSize)
+                }
+                "stco", "co64" -> {
+                    reader.seek(boxStart + boxSize)
+                }
+                "stss" -> {
+                    reader.seek(boxStart + boxSize)
+                }
+                else -> {
+                    reader.seek(boxStart + boxSize)
+                }
+            }
+
+            reader.seek(boxStart + boxSize)
+        }
+
+    }
+
+    fun parseStsd(offset: Long, size: Long): StsdBox {
+        reader.seek(offset)
+        val end = offset + size
+
+        val boxSize = reader.readInt().toLong()
+        val typeBytes = ByteArray(4).also { reader.readFully(it) }
+        val type = String(typeBytes)
+
+        if (type != "stsd") {
+            println("Unexpected box type: $type at $offset")
+            return StsdBox(offset, size)
+        }
+
+        reader.skipBytes(4) // version + flags
+        val entryCount = reader.readInt()
+
+        val stsdBox = StsdBox(offset, boxSize)
+        var currentOffset = reader.filePointer
+        var index = 1
+
+        while (currentOffset + 8 <= end && index <= entryCount) {
+            reader.seek(currentOffset)
+            val entrySize = reader.readInt().toLong()
+            val entryTypeBytes = ByteArray(4).also { reader.readFully(it) }
+            val entryType = String(entryTypeBytes)
+
+            val entryEnd = currentOffset + entrySize
+
+            when (entryType) {
+                "avc1", "hev1", "hvc1", "vp09", "av01" -> reader.skipBytes(78)
+                "mp4a", "ac-3", "ec-3", "opus" -> reader.skipBytes(28)
+                else -> reader.skipBytes(8)
+            }
+
+            val entry = SampleEntry(entryType, currentOffset, entrySize)
+            entry.boxes.addAll(parseSampleEntryBoxes(reader.filePointer, entryEnd, entryType))
+            stsdBox.entries.add(entry)
+
+            currentOffset = entryEnd
+            index++
+        }
+
+        return stsdBox
+    }
+
+    fun parseSampleEntryBoxes(start: Long, end: Long, parentType: String): List<Any> {
+        val boxes = mutableListOf<Any>()
+        var current = start
+
+        while (current + 8 <= end) {
+            reader.seek(current)
+            val size = reader.readInt().toLong()
+            val typeBytes = ByteArray(4).also { reader.readFully(it) }
+            val type = String(typeBytes)
+
+            if (size < 8 || current + size > end) break
+
+            val contentOffset = current + 8
+            val contentSize = size - 8
+
+            when (type) {
+                "avcC" -> boxes.add(parseAvcC(reader,contentOffset))
+                "btrt" -> boxes.add(parseBtrt(reader,contentOffset))
+                "pasp" -> boxes.add(parsePasp(reader,contentOffset))
+                "colr" -> boxes.add(parseColr(reader,contentOffset, contentSize))
+                "esds" -> boxes.add(parseEsds(reader,contentOffset))
+            }
+
+            current += size
+        }
+        return boxes
+    }
+
+    fun readBoxHeader(): BoxHeader? {
+        if (reader.filePointer + 8 > reader.length()) return null
+
+        val startOffset = reader.filePointer
+        val size = reader.readInt().toLong()
+        val typeBytes = ByteArray(4).also { reader.readFully(it) }
+        val type = String(typeBytes, Charsets.US_ASCII)
+
+        if (size < 8 || startOffset + size > reader.length()) {
+            println("⚠️ Invalid box detected: type=$type at $startOffset, size=$size")
+            return null
+        }
+
+        val payloadOffset = reader.filePointer
+        val payloadSize = size - 8
+
+        return BoxHeader(type, size, startOffset, payloadOffset, payloadSize)
+    }
+
+    fun skipBox(box: BoxHeader) {
+        reader.seek(box.startOffset + box.size)
     }
 
 

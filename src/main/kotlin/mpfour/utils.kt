@@ -2,6 +2,7 @@ package mpfour
 
 import mpfour.models.TfdtBox
 import mpfour.models.TfhdBox
+import org.ytmuxer.webm.convertBytes
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -11,6 +12,13 @@ import java.nio.ByteOrder
 
 
 
+data class BoxHeader(
+    val type: String,
+    val size: Long,
+    val startOffset: Long,
+    val payloadOffset: Long,
+    val payloadSize: Long
+)
 
 data class VideoTrackInfo(
     var stsdBox: ByteArray? = null,
@@ -25,6 +33,98 @@ data class MoofBox(
     val boxOffset: Long,
     val boxSize: Long,
 ): BoxInfo(boxOffset, boxSize)
+
+data class Mvhd(
+    val timeScale: Int,
+    val duration: Long
+)
+data class TkhdBox(
+    val id:Int,
+    val duration:Int,
+    val width:Double,
+    val height:Double
+)
+
+data class Tkhd(
+    val creationTime: Long,
+    val modificationTime: Long,
+    val trackId: Int,
+    val duration: Long
+)
+
+data class MdhdBox(
+    val version: Int,
+    val creationTime: Long,
+    val modificationTime: Long,
+    val timescale: Long,
+    val duration: Long,
+    val language: String
+)
+
+data class HdlrBox(
+    val handlerType: String,
+    val handlerName: String
+)
+
+
+data class VmhdBox(
+    val graphicsMode: Int,
+    val opColor: Triple<Int, Int, Int>
+)
+
+data class SmhdBox(
+    val balance: Float
+)
+
+data class DinfBox(
+    val drefCount: Int
+)
+
+// --- Root: stsd ---
+data class StsdBox(
+    val offset: Long,
+    val size: Long,
+    val entries: MutableList<SampleEntry> = mutableListOf()
+)
+
+// --- Represents one SampleEntry inside stsd ---
+data class SampleEntry(
+    val type: String,
+    val offset: Long,
+    val size: Long,
+    val boxes: MutableList<Any> = mutableListOf()
+)
+
+// --- Nested box types ---
+data class AvcCBox(
+    val profileIndication: Int,
+    val levelIndication: Int,
+    val nalLengthSize: Int
+)
+
+data class BtrtBox(
+    val bufferSizeDB: Int,
+    val maxBitrate: Int,
+    val avgBitrate: Int
+)
+
+data class PaspBox(
+    val hSpacing: Int,
+    val vSpacing: Int
+)
+
+data class ColrBox(
+    val type: String,
+    val primaries: Int? = null,
+    val transfer: Int? = null,
+    val matrix: Int? = null,
+    val fullRange: Boolean? = null
+)
+
+data class EsdsBox(
+    val tag: Int
+)
+
 
 
 class utils {
@@ -469,6 +569,333 @@ fun parseTfhd(reader: RandomAccessFile, offset: Long,mdatOffset: Long): TfhdBox 
         )
 }
 
+fun countEntriesInMoof(reader: RandomAccessFile, moofOffset: Long, moofSize: Long): Int {
+    var totalTrunEntries = 0L
+    var offset = moofOffset
+    val moofEnd = moofOffset + moofSize
+
+    while (offset + 8 <= moofEnd) {
+        reader.seek(offset)
+        val size = reader.readInt().toLong()
+        val typeBytes = ByteArray(4).also { reader.readFully(it) }
+        val type = String(typeBytes, Charsets.US_ASCII)
+        val nextBox = offset + size
+
+        if (type == "traf") {
+            var innerOffset = offset + 8
+            val trafEnd = offset + size
+
+            while (innerOffset + 8 <= trafEnd) {
+                reader.seek(innerOffset)
+                val subSize = reader.readInt().toLong()
+                val subTypeBytes = ByteArray(4).also { reader.readFully(it) }
+                val subType = String(subTypeBytes, Charsets.US_ASCII)
+                val subBoxEnd = innerOffset + subSize
+
+                if (subType == "trun" && subSize >= 12) {
+                    // Skip version and flags
+                    reader.skipBytes(4)
+                    val entryCount = reader.readInt()
+                    totalTrunEntries += entryCount
+                }
+
+                innerOffset = subBoxEnd
+            }
+        }
+
+        offset = nextBox
+    }
+
+    return totalTrunEntries.toInt()
+}
+
+//==========these will be used to parse file============
+fun parseMvhd(reader: RandomAccessFile,offset: Long): Mvhd {
+    reader.seek(offset)
+    val version = reader.readUnsignedByte()
+    reader.skipBytes(3) // flags
+
+    if (version == 1) {
+        reader.skipBytes(8 + 8) // creation + modification
+        val timescale = reader.readInt()
+        val duration = reader.readLong()
+        return Mvhd(
+            timescale,
+            duration
+        )
+    } else {
+        reader.skipBytes(4 + 4) // creation + modification
+        val timescale = reader.readInt()
+        val duration = reader.readInt()
+        return Mvhd(
+            timescale,
+            duration.toLong()
+        )
+    }
+}
+fun parseTkhd(reader: RandomAccessFile, offset: Long): Tkhd {
+    reader.seek(offset)
+    val version = reader.readUnsignedByte()
+    reader.skipBytes(3) // flags
+
+    val creationTime: Long
+    val modificationTime: Long
+    val trackId: Int
+    val duration: Long
+
+    if (version == 1) {
+        creationTime = reader.readLong()
+        modificationTime = reader.readLong()
+        trackId = reader.readInt()
+        reader.skipBytes(4) // reserved
+        duration = reader.readLong()
+    } else {
+        creationTime = reader.readInt().toLong() and 0xFFFFFFFFL
+        modificationTime = reader.readInt().toLong() and 0xFFFFFFFFL
+        trackId = reader.readInt()
+        reader.skipBytes(4) // reserved
+        duration = reader.readInt().toLong() and 0xFFFFFFFFL
+    }
+
+    reader.skipBytes(8) // reserved
+    val layer = reader.readShort()
+    val alternateGroup = reader.readShort()
+    val volume = reader.readShort()
+    reader.skipBytes(2) // reserved
+
+    // Transformation matrix (3x3) — 9 * 4 bytes
+    val matrix = IntArray(9) { reader.readInt() }
+
+    // Track width/height in 16.16 fixed point
+    val width = reader.readInt() / 65536.0
+    val height = reader.readInt() / 65536.0
+    return Tkhd(
+        creationTime = creationTime,
+        modificationTime = modificationTime,
+        trackId = trackId,
+        duration = duration
+    )
+}
+
+fun parseEdts(reader: RandomAccessFile, doLogging: Boolean, offset: Long, size: Long) {
+    val edtsEnd = offset + size
+    reader.seek(offset)
+    while (reader.filePointer + 8 <= edtsEnd) {
+        val boxStart = reader.filePointer
+        val boxSize = reader.readInt().toLong()
+        val typeBytes = ByteArray(4).also { reader.readFully(it) }
+        val type = String(typeBytes, Charsets.US_ASCII)
+        val payloadOffset = boxStart + 8
+        val payloadSize = boxSize - 8
+        if (boxSize < 8 || boxStart + boxSize > edtsEnd) break
+        if (doLogging){
+            println(
+                "Box: $type | BoxOffset: $payloadOffset | BoxSize: $payloadSize | " +
+                        "PayloadOffset: $payloadOffset | PayloadSize: ${convertBytes(payloadSize)}"
+            )
+        }
+
+        when (type) {
+            "elst" -> {
+                parseElst(reader,payloadOffset, payloadSize)
+                reader.seek(payloadOffset+payloadSize)
+            }
+            else -> reader.seek(payloadOffset + payloadSize)
+        }
+    }
+
+    reader.seek(edtsEnd)
+}
+
+fun parseElst(reader: RandomAccessFile,offset: Long, size: Long) {
+    reader.seek(offset)
+    val version = reader.readUnsignedByte()
+    reader.skipBytes(3) // flags
+    val entryCount = reader.readInt()
+
+    for (i in 0 until entryCount) {
+        val segmentDuration: Long
+        val mediaTime: Long
+        val mediaRate: Double
+
+        if (version == 1) {
+            segmentDuration = reader.readLong()
+            mediaTime = reader.readLong()
+        } else {
+            segmentDuration = reader.readInt().toLong() and 0xFFFFFFFFL
+            mediaTime = reader.readInt().toLong() and 0xFFFFFFFFL
+        }
+
+        val mediaRateInteger = reader.readShort()
+        val mediaRateFraction = reader.readShort()
+        mediaRate = mediaRateInteger + mediaRateFraction / 65536.0
+
+    }
+}
+
+fun parseMdhd(reader: RandomAccessFile,offset: Long): MdhdBox {
+    reader.seek(offset)
+    val version = reader.readUnsignedByte()
+    reader.skipBytes(3) // flags
+
+    val creationTime: Long
+    val modificationTime: Long
+    val timescale: Long
+    val duration: Long
+
+    if (version == 1) {
+        creationTime = reader.readLong()
+        modificationTime = reader.readLong()
+        timescale = reader.readInt().toLong() and 0xFFFFFFFFL
+        duration = reader.readLong()
+    } else {
+        creationTime = reader.readInt().toLong() and 0xFFFFFFFFL
+        modificationTime = reader.readInt().toLong() and 0xFFFFFFFFL
+        timescale = reader.readInt().toLong() and 0xFFFFFFFFL
+        duration = reader.readInt().toLong() and 0xFFFFFFFFL
+    }
+
+    val langBytes = reader.readShort().toInt()
+    val language = buildString {
+        append(((langBytes shr 10) and 0x1F) + 0x60)
+        append(((langBytes shr 5) and 0x1F) + 0x60)
+        append((langBytes and 0x1F) + 0x60)
+    }.map { it.toChar() }.joinToString("")
+
+    reader.skipBytes(2) // pre-defined
+    return MdhdBox(
+        version = version,
+        creationTime = creationTime,
+        modificationTime = modificationTime,
+        timescale = timescale,
+        duration = duration,
+        language = language
+    )
+
+}
+
+fun parseHdlr(reader: RandomAccessFile,offset: Long, size: Long): HdlrBox {
+    reader.seek(offset)
+    reader.skipBytes(4) // pre-defined (0)
+    val handlerTypeBytes = ByteArray(4)
+    reader.readFully(handlerTypeBytes)
+    val handlerType = String(handlerTypeBytes, Charsets.US_ASCII)
+
+    reader.skipBytes(12) // reserved
+    val nameLength = (size - (reader.filePointer - offset)).toInt()
+    val nameBytes = ByteArray(nameLength.coerceAtLeast(0))
+    reader.readFully(nameBytes)
+    val handlerName = String(nameBytes).trimEnd('\u0000')
+    return HdlrBox(
+        handlerType = handlerType,
+        handlerName = handlerName
+    )
+
+}
+
+fun parseVmhd(reader: RandomAccessFile, offset: Long): VmhdBox {
+    reader.seek(offset)
+    val version = reader.readUnsignedByte()
+    reader.skipBytes(3) // flags (should be 0x000001 for 'vmhd')
+
+    val graphicsMode = reader.readUnsignedShort()
+    val opColorR = reader.readUnsignedShort()
+    val opColorG = reader.readUnsignedShort()
+    val opColorB = reader.readUnsignedShort()
+
+    return VmhdBox(
+        graphicsMode = graphicsMode,
+        opColor = Triple(opColorR, opColorG, opColorB)
+    )
+}
+
+fun parseSmhd(reader: RandomAccessFile, offset: Long): SmhdBox {
+    reader.seek(offset)
+    val version = reader.readUnsignedByte()
+    reader.skipBytes(3) // flags
+
+    val balanceFixed16 = reader.readShort().toInt()
+    reader.skipBytes(2) // reserved
+
+    val balance = balanceFixed16 / 256f // convert 8.8 fixed-point to float
+
+    return SmhdBox(balance = balance)
+}
+
+fun parseDinf(reader: RandomAccessFile, offset: Long, size: Long): DinfBox {
+    val dinfEnd = offset + size
+    reader.seek(offset)
+
+    var drefCount = 0
+
+    while (reader.filePointer + 8 <= dinfEnd) {
+        val boxStart = reader.filePointer
+        val boxSize = reader.readInt().toLong()
+        val typeBytes = ByteArray(4).also { reader.readFully(it) }
+        val type = String(typeBytes, Charsets.US_ASCII)
+        val payloadOffset = reader.filePointer
+        val payloadSize = boxSize - 8
+
+        if (type == "dref") {
+            reader.skipBytes(4) // version + flags
+            drefCount = reader.readInt()
+            // skip rest of entries (we ignore URLs/URNs for now)
+        }
+
+        reader.seek(boxStart + boxSize)
+    }
+
+    return DinfBox(drefCount = drefCount)
+}
+
+
+fun parseAvcC(reader: RandomAccessFile,offset: Long): AvcCBox {
+    reader.seek(offset)
+    val version = reader.readUnsignedByte()
+    val profile = reader.readUnsignedByte()
+    val compat = reader.readUnsignedByte()
+    val level = reader.readUnsignedByte()
+    val lengthSize = reader.readUnsignedByte() and 0x3
+    return AvcCBox(profile, level, lengthSize + 1)
+}
+
+fun parseBtrt(reader: RandomAccessFile,offset: Long): BtrtBox {
+    reader.seek(offset)
+    val buffer = reader.readInt()
+    val max = reader.readInt()
+    val avg = reader.readInt()
+    return BtrtBox(buffer, max, avg)
+}
+
+fun parsePasp(reader: RandomAccessFile,offset: Long): PaspBox {
+    reader.seek(offset)
+    val h = reader.readInt()
+    val v = reader.readInt()
+    return PaspBox(h, v)
+}
+
+fun parseColr(reader: RandomAccessFile,offset: Long, size: Long): ColrBox {
+    reader.seek(offset)
+    val typeBytes = ByteArray(4).also { reader.readFully(it) }
+    val type = String(typeBytes)
+    return if (type == "nclx" && size >= 11) {
+        val prim = reader.readUnsignedShort()
+        val trans = reader.readUnsignedShort()
+        val matrix = reader.readUnsignedShort()
+        val full = reader.readUnsignedByte() and 0x80 != 0
+        ColrBox(type, prim, trans, matrix, full)
+    } else {
+        ColrBox(type)
+    }
+}
+
+fun parseEsds(reader: RandomAccessFile,offset: Long): EsdsBox {
+    reader.seek(offset)
+    reader.skipBytes(4)
+    val tag = reader.readUnsignedByte()
+    return EsdsBox(tag)
+}
+
 fun RandomAccessFile.readUInt8(): Int =
     readUnsignedByte()
 
@@ -577,6 +1004,27 @@ fun saveH264Frame(
 */
 
 
+
+/*fun parseTkhd(reader: RandomAccessFile, offset: Long): TkhdBox {
+    reader.seek(offset)
+    val version = reader.readUnsignedByte()
+    reader.skipBytes(3) // flags
+    val creationTime = reader.readInt()
+    val modificationTime = reader.readInt()
+    val trackId = reader.readInt()
+    reader.skipBytes(4) // reserved
+    val duration = reader.readInt()
+    reader.skipBytes(8) // reserved
+    val layer = reader.readShort()
+    val alternateGroup = reader.readShort()
+    val volume = reader.readShort()
+    reader.skipBytes(2) // reserved
+    reader.skipBytes(36) // matrix
+    val width = reader.readInt() / 65536.0
+    val height = reader.readInt() / 65536.0
+
+    return TkhdBox(trackId, duration, width, height)
+}*/
 
 
 
