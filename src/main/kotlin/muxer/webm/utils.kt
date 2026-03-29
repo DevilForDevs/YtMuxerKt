@@ -63,7 +63,7 @@ fun buildEbmlHeader(): ByteArray {
     // EBMLMaxSizeLength (0x42F3)
     writeElement(data, 0x42F3, byteArrayOf(0x08))
     // DocType (0x4282) - "webm"
-    writeElement(data, 0x4282, "muxer/webm".toByteArray(Charsets.US_ASCII))
+    writeElement(data, 0x4282, "webm".toByteArray(Charsets.US_ASCII))
     // DocTypeVersion (0x4287)
     writeElement(data, 0x4287, byteArrayOf(0x04))
     // DocTypeReadVersion (0x4285)
