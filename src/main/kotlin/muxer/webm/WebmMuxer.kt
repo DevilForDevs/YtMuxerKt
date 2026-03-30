@@ -46,6 +46,92 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
         output.write(ebmlHeader)
     }
 
+    private fun writeClusters() {
+
+        var clusterStart = 0L
+        var clusterSizePos = 0L
+        var clusterTimecode = 0L
+
+        var videoBlock = sources[0].getBlock()
+        var audioBlock = sources[1].getBlock()
+
+        fun patchClusterSize() {
+            if (clusterStart != 0L) {
+                val clusterEnd = output.filePointer
+                val clusterSize = clusterEnd - clusterStart
+                output.seek(clusterSizePos)
+                output.write(helper.encodeVInt8(clusterSize,8))
+                output.seek(clusterEnd)
+            }
+        }
+
+        while (videoBlock != null || audioBlock != null) {
+
+            // Start new cluster on video keyframe
+            if (videoBlock != null && videoBlock.isKeyframe) {
+                patchClusterSize()
+
+                val clusterHeaderStart = output.filePointer
+                output.write(helper.idToBytes(0x1F43B675))     // Cluster ID
+                clusterSizePos = output.filePointer
+                output.write(ByteArray(8))              // reserve size
+                clusterStart = output.filePointer
+
+                clusterTimecode = videoBlock.absoluteTimecode
+                output.write(helper.writeElement(0xE7, helper.encodeTimecode(clusterTimecode.toInt())))
+
+
+
+                // Write blocks in cluster
+                while (true) {
+                    val nextBlock = when {
+                        videoBlock != null && audioBlock != null ->
+                            if (videoBlock.absoluteTimecode <= audioBlock.absoluteTimecode) videoBlock else audioBlock
+                        videoBlock != null -> videoBlock
+                        audioBlock != null -> audioBlock
+                        else -> null
+                    } ?: break
+
+                    val relTime = nextBlock.absoluteTimecode - clusterTimecode
+                    val track = if (nextBlock == videoBlock) 1 else 2
+                    writeSimpleBlock(nextBlock, track, relTime)
+
+
+                    if (nextBlock == videoBlock) videoBlock = sources[0].getBlock()
+                    else audioBlock = sources[1].getBlock()
+
+                    // Break on next video keyframe
+                    if (videoBlock != null && videoBlock.isKeyframe && nextBlock != videoBlock) break
+                }
+
+            } else {
+                // Write blocks if not starting a new cluster
+                val nextBlock = when {
+                    videoBlock != null && audioBlock != null ->
+                        if (videoBlock.absoluteTimecode <= audioBlock.absoluteTimecode) videoBlock else audioBlock
+                    videoBlock != null -> videoBlock
+                    audioBlock != null -> audioBlock
+                    else -> null
+                } ?: break
+
+                val relTime = nextBlock.absoluteTimecode - clusterTimecode
+                val track = if (nextBlock == videoBlock) 1 else 2
+                writeSimpleBlock(nextBlock, track, relTime)
+
+                if (nextBlock == videoBlock) videoBlock = sources[0].getBlock()
+                else audioBlock = sources[1].getBlock()
+            }
+        }
+
+        patchClusterSize()
+
+    }
+
+    fun writeSimpleBlock(block: BlockEntry, track: Int, blockTimeCode: Long) {
+        val blockData=helper.writeSimpleBlock(block,track,blockTimeCode)
+        output.write(helper.writeMasterElementBytes(0xA3, blockData))
+    }
+
 
     fun writeSegment() {
         // --- Start of the Segment ---
@@ -60,7 +146,7 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
 
         writeInfo(sources.maxOfOrNull { it.duration } ?: 0.0)
         writeTracks()
-
+        writeClusters()
 
         // --- Finish Segment size ---
         val segmentEnd = output.filePointer
