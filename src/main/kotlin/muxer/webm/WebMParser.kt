@@ -148,11 +148,11 @@ class WebMParser(private val reader: RandomAccessFile,private val doLogging: Boo
             val contentOffset = offset + headerSize
             val name = elementNames[id] ?: "Unknown"
             if (doLogging){
-
+                val totalSize = headerSize + size
                 if (name=="Unknown"){
                     println("Unknown Element with id: $id Payload size: $size ")
                 }else{
-                    println("Top Level Element: ${name} At: $offset  Payload Size: ${convertBytes(size)}")
+                    println("Top Level Element: ${name} At: $offset  Payload,Header,Total Size :: ${convertBytes(size)}, ${convertBytes(totalSize-size)} ${convertBytes(totalSize)}")
                 }
             }
             when (id) {
