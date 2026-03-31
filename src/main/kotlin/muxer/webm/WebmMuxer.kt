@@ -81,16 +81,17 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
 
         writeInfo(sources.maxOfOrNull { it.duration } ?: 0.0)
         writeTracks()
-        writeClusters(segmentStart)
 
-        if (firstCluter!=null){
-            val clusterStartoffsetRelativeTosegment=firstCluter!!-segmentStart
-            overwriteUInt32At(
-                output,
-                segmentStart+46,
-                clusterStartoffsetRelativeTosegment.toInt()
-            )
-        }
+
+
+        val cuesReserveSize = 65535 // 64 KB
+        val voidId = 0xEC
+        val voidSizeBytes = helper.encodeVInt8(cuesReserveSize.toLong(), 8)
+        val cuesStartPos=output.filePointer
+        output.write(helper.idToBytes(voidId.toLong()))     // Void element ID
+        output.write(voidSizeBytes)                // Void element size
+        output.write(ByteArray(cuesReserveSize))   // fill with zero bytes
+
 
 
 
@@ -164,6 +165,9 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
                 patchClusterSize()
 
                 val clusterHeaderStart = output.filePointer
+                if (firstCluter==null){
+                    firstCluter=clusterHeaderStart
+                }
                 output.write(helper.idToBytes(0x1F43B675))     // Cluster ID
                 clusterSizePos = output.filePointer
                 output.write(ByteArray(8))              // reserve size
@@ -256,5 +260,14 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
     }
 
 }
+
+/*if (firstCluter!=null){
+            val clusterStartoffsetRelativeTosegment=firstCluter!!-segmentStart
+            overwriteUInt32At(
+                output,
+                segmentStart+46,
+                clusterStartoffsetRelativeTosegment.toInt()
+            )
+        }*/
 
 
