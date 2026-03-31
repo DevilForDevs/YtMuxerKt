@@ -1,7 +1,5 @@
 package muxer.webm
 
-import okhttp3.internal.addHeaderLenient
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.RandomAccessFile
 
@@ -11,7 +9,10 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
      var totalBlocksFromAllSources=0
      val helper= Helper()
 
+
     val listBuffer = mutableListOf<ByteArray>()
+    var firstCluter: Long?=null
+
 
     init {
         // this code must be inside init or a function
@@ -31,6 +32,8 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
             0xbb.toByte(), 0x6b, 0x53, 0xac.toByte(), 0x84.toByte(),
             /* cues offset [7] */ 0x00, 0x00, 0x00, 0x00
         ))
+
+
     }
 
 
@@ -41,16 +44,105 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
         }
     }
 
+    fun overwriteUInt32At(
+        raf: RandomAccessFile,
+        position: Long,
+        value: Int
+    ) {
+        val current = raf.filePointer
+
+        raf.seek(position)
+
+        raf.write((value shr 24) and 0xFF)
+        raf.write((value shr 16) and 0xFF)
+        raf.write((value shr 8) and 0xFF)
+        raf.write(value and 0xFF)
+
+        raf.seek(current) // restore pointer
+    }
+
     private fun writeEbmlHeader() {
         val ebmlHeader = buildEbmlHeader()
         output.write(ebmlHeader)
     }
 
-    private fun writeClusters() {
 
+
+    fun writeSegment() {
+        // --- Start of the Segment ---
+        output.write(helper.hexToBytes("18 53 80 67")) // Segment ID
+
+        val segmentSizePos = output.filePointer
+        output.write(ByteArray(8)) // placeholder for segment size
+        val segmentStart = output.filePointer
+
+        val combined = listBuffer.fold(ByteArray(0)) { acc, bytes -> acc + bytes }
+        output.write(combined)
+
+        writeInfo(sources.maxOfOrNull { it.duration } ?: 0.0)
+        writeTracks()
+        writeClusters(segmentStart)
+
+        if (firstCluter!=null){
+            val clusterStartoffsetRelativeTosegment=firstCluter!!-segmentStart
+            overwriteUInt32At(
+                output,
+                segmentStart+46,
+                clusterStartoffsetRelativeTosegment.toInt()
+            )
+        }
+
+
+
+        // --- Finish Segment size ---
+        val segmentEnd = output.filePointer
+        val segmentSize = segmentEnd - segmentStart
+        output.seek(segmentSizePos)
+        output.write(helper.encodeVInt8(segmentSize, 8))
+        output.seek(segmentEnd)
+    }
+
+    fun printHexFromFile(raf: RandomAccessFile, position: Long, length: Int) {
+        val current = raf.filePointer
+
+        val buffer = ByteArray(length)
+        raf.seek(position)
+        raf.readFully(buffer)
+
+        buffer.forEachIndexed { i, b ->
+            println(String.format("%03d : %02X", i, b))
+        }
+
+        raf.seek(current) // restore pointer
+    }
+
+
+
+
+
+    private fun writeInfo(duration: Double) {
+        val info=helper.muxerInfoBytes(duration)
+        val idBytes = helper.idToBytes(0x1549A966)
+        val sizeBytes = encodeVInt(info.size.toLong())
+        val wholeElemnet=idBytes + sizeBytes + info
+        output.write(wholeElemnet)
+    }
+
+    private fun writeTracks() {
+        val tracks = helper.trakBytes(sources).toByteArray()
+        val idBytes = helper.idToBytes(0x1654AE6B)
+        val sizeBytes = encodeVInt(tracks.size.toLong())
+        val wholeElemnet = idBytes + sizeBytes + tracks
+        output.write(wholeElemnet)
+    }
+
+    private fun writeClusters(segmentStart: Long): MutableList<CueEntry> {
+        val listOfCues = mutableListOf<CueEntry>()
         var clusterStart = 0L
         var clusterSizePos = 0L
         var clusterTimecode = 0L
+        var lastCueTime = -1L
+        var blocksProcessed = 0  // ✅ Track progress
 
         var videoBlock = sources[0].getBlock()
         var audioBlock = sources[1].getBlock()
@@ -60,7 +152,7 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
                 val clusterEnd = output.filePointer
                 val clusterSize = clusterEnd - clusterStart
                 output.seek(clusterSizePos)
-                output.write(helper.encodeVInt8(clusterSize,8))
+                output.write(helper.encodeVInt8(clusterSize, 8))
                 output.seek(clusterEnd)
             }
         }
@@ -80,7 +172,17 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
                 clusterTimecode = videoBlock.absoluteTimecode
                 output.write(helper.writeElement(0xE7, helper.encodeTimecode(clusterTimecode.toInt())))
 
-
+                // Add cue if new timecode
+                if (clusterTimecode != lastCueTime) {
+                    listOfCues.add(
+                        CueEntry(
+                            cueTime = clusterTimecode,
+                            cueClusterPosition = clusterHeaderStart - segmentStart,
+                            cueTrack = 1
+                        )
+                    )
+                    lastCueTime = clusterTimecode
+                }
 
                 // Write blocks in cluster
                 while (true) {
@@ -96,6 +198,16 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
                     val track = if (nextBlock == videoBlock) 1 else 2
                     writeSimpleBlock(nextBlock, track, relTime)
 
+                    // ✅ Increment processed blocks
+                    blocksProcessed++
+
+                    // ✅ Filtered progress updates
+                    if (blocksProcessed % 2000 == 0 || nextBlock == videoBlock && videoBlock == null && audioBlock == null) {
+                        progress(
+                            "Merging - $blocksProcessed/$totalBlocksFromAllSources Samples",
+                            (blocksProcessed * 100 / totalBlocksFromAllSources).toInt()
+                        )
+                    }
 
                     if (nextBlock == videoBlock) videoBlock = sources[0].getBlock()
                     else audioBlock = sources[1].getBlock()
@@ -118,13 +230,24 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
                 val track = if (nextBlock == videoBlock) 1 else 2
                 writeSimpleBlock(nextBlock, track, relTime)
 
+                // ✅ Increment processed blocks
+                blocksProcessed++
+
+                // ✅ Filtered progress updates
+                if (blocksProcessed % 2000 == 0 || nextBlock == videoBlock && videoBlock == null && audioBlock == null) {
+                    progress(
+                        "Merging - $blocksProcessed/$totalBlocksFromAllSources Samples",
+                        (blocksProcessed * 100 / totalBlocksFromAllSources).toInt()
+                    )
+                }
+
                 if (nextBlock == videoBlock) videoBlock = sources[0].getBlock()
                 else audioBlock = sources[1].getBlock()
             }
         }
 
         patchClusterSize()
-
+        return listOfCues
     }
 
     fun writeSimpleBlock(block: BlockEntry, track: Int, blockTimeCode: Long) {
@@ -132,45 +255,6 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
         output.write(helper.writeMasterElementBytes(0xA3, blockData))
     }
 
-
-    fun writeSegment() {
-        // --- Start of the Segment ---
-        output.write(helper.hexToBytes("18 53 80 67")) // Segment ID
-
-        val segmentSizePos = output.filePointer
-        output.write(ByteArray(8)) // placeholder for segment size
-        val segmentStart = output.filePointer
-
-        val combined = listBuffer.fold(ByteArray(0)) { acc, bytes -> acc + bytes }
-        output.write(combined)
-
-        writeInfo(sources.maxOfOrNull { it.duration } ?: 0.0)
-        writeTracks()
-        writeClusters()
-
-        // --- Finish Segment size ---
-        val segmentEnd = output.filePointer
-        val segmentSize = segmentEnd - segmentStart
-        output.seek(segmentSizePos)
-        output.write(helper.encodeVInt8(segmentSize, 8))
-        output.seek(segmentEnd)
-    }
-
-    private fun writeInfo(duration: Double) {
-        val info=helper.muxerInfoBytes(duration)
-        val idBytes = helper.idToBytes(0x1549A966)
-        val sizeBytes = encodeVInt(info.size.toLong())
-        val wholeElemnet=idBytes + sizeBytes + info
-        output.write(wholeElemnet)
-    }
-
-    private fun writeTracks() {
-        val tracks = helper.trakBytes(sources).toByteArray()
-        val idBytes = helper.idToBytes(0x1654AE6B)
-        val sizeBytes = encodeVInt(tracks.size.toLong())
-        val wholeElemnet = idBytes + sizeBytes + tracks
-        output.write(wholeElemnet)
-    }
 }
 
 

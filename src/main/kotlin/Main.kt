@@ -1,6 +1,7 @@
 import muxer.webm.WebMParser
 import muxer.webm.WebmMuxer
 import java.io.File
+import java.io.IOException
 import java.io.RandomAccessFile
 
 
@@ -28,6 +29,50 @@ fun main() {
     debugUsingFffmpeg(otfile)
 
 
+
+
+}
+
+fun muxWithFFmpeg(videoFile: File, audioFile: File, outputFile: File) {
+    try {
+        if (outputFile.exists()) {
+            outputFile.delete()
+        }
+
+        // Build the FFmpeg command
+        val cmd = listOf(
+            "ffmpeg",
+            "-y",                     // overwrite if exists
+            "-i", videoFile.absolutePath,
+            "-i", audioFile.absolutePath,
+            "-c", "copy",             // copy streams, no re-encoding
+            "-map", "0:v:0",          // take video from first input
+            "-map", "1:a:0",          // take audio from second input
+            outputFile.absolutePath
+        )
+
+        // Run the command
+        val process = ProcessBuilder(cmd)
+            .redirectErrorStream(true)
+            .start()
+
+        // Print FFmpeg output to console
+        process.inputStream.bufferedReader().useLines { lines ->
+            lines.forEach { println(it) }
+        }
+
+        val exitCode = process.waitFor()
+        if (exitCode == 0) {
+            println("Muxing completed successfully: ${outputFile.absolutePath}")
+        } else {
+            println("Muxing failed with exit code $exitCode")
+        }
+
+    } catch (e: IOException) {
+        e.printStackTrace()
+    } catch (e: InterruptedException) {
+        e.printStackTrace()
+    }
 }
 
 fun debugUsingFffmpeg(outputFile: File){
