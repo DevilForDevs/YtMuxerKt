@@ -1,7 +1,9 @@
 package muxer.webm
 
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.RandomAccessFile
+import kotlin.experimental.or
 
 
 class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val progress: (Samples: String, percent: Int) -> Unit = { _, _ -> } ) {
@@ -21,10 +23,10 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
             0x4d, 0xbb.toByte(), 0x8b.toByte(),
             0x53, 0xab.toByte(), 0x84.toByte(), 0x15, 0x49, 0xa9.toByte(), 0x66, 0x53,
             0xac.toByte(), 0x81.toByte(),
-            /* info offset */ 0x4F.toByte(),
+            /* info offset */ 0x00, 0x00, 0x00, 0x00,
             0x4d, 0xbb.toByte(), 0x8b.toByte(), 0x53, 0xab.toByte(),
             0x84.toByte(), 0x16, 0x54, 0xae.toByte(), 0x6b, 0x53, 0xac.toByte(), 0x81.toByte(),
-            /* tracks offset */ 0x83.toByte(),
+            /* tracks offset */ 0x00, 0x00, 0x00, 0x00,
             0x4d, 0xbb.toByte(), 0x8e.toByte(), 0x53, 0xab.toByte(), 0x84.toByte(), 0x1f.toByte(),
             0x43, 0xb6.toByte(), 0x75, 0x53, 0xac.toByte(), 0x84.toByte(),
             /* cluster offset [2] */ 0x00, 0x00, 0x00, 0x00,
@@ -76,21 +78,39 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
         output.write(ByteArray(8)) // placeholder for segment size
         val segmentStart = output.filePointer
 
-        val combined = listBuffer.fold(ByteArray(0)) { acc, bytes -> acc + bytes }
-        output.write(combined)
+
+
+
+
+        //seekelemnet startws
+        output.write(helper.idToBytes(0x114D9B74)) // SeekHead ID
+        val seekHeadSizePos = output.filePointer
+        output.write(ByteArray(8)) // reserve size
+        val seekHeadStart = output.filePointer
+
+        val seek = ByteArrayOutputStream()
+
+        val seekPosOffset = output.filePointer
+        seek.write(helper.writeElement(0x53AB, helper.idToBytes(0x1549A966L)))
+        seek.write(helper.writeElement(0x53AC, helper.encodeUInt(0))) // relative to segment start
+        output.write(helper.writeElement(0x4DBB, seek.toByteArray()))
+
+
+
+        val seekHeadEnd = output.filePointer
+        val seekHeadSize = seekHeadEnd - seekHeadStart
+        output.seek(seekHeadSizePos)
+        output.write(helper.encodeVInt8(seekHeadSize, 8))
+        output.seek(seekHeadEnd)
+
+        //seekelemnet ends
+
 
         writeInfo(sources.maxOfOrNull { it.duration } ?: 0.0)
         writeTracks()
+        writeClusters(segmentStart)
 
 
-
-        val cuesReserveSize = 65535 // 64 KB
-        val voidId = 0xEC
-        val voidSizeBytes = helper.encodeVInt8(cuesReserveSize.toLong(), 8)
-        val cuesStartPos=output.filePointer
-        output.write(helper.idToBytes(voidId.toLong()))     // Void element ID
-        output.write(voidSizeBytes)                // Void element size
-        output.write(ByteArray(cuesReserveSize))   // fill with zero bytes
 
 
 
@@ -99,9 +119,22 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
         val segmentEnd = output.filePointer
         val segmentSize = segmentEnd - segmentStart
         output.seek(segmentSizePos)
-        output.write(helper.encodeVInt8(segmentSize, 8))
+        val segmentSizeByte=helper.encodeVInt8(segmentSize, 8)
+        println(segmentSizeByte)
+        output.write(segmentSizeByte)
         output.seek(segmentEnd)
+
+        printHexFromFile(output,0,100)
+
+
+
+
+
+
+
+
     }
+
 
     fun printHexFromFile(raf: RandomAccessFile, position: Long, length: Int) {
         val current = raf.filePointer
@@ -116,9 +149,6 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
 
         raf.seek(current) // restore pointer
     }
-
-
-
 
 
     private fun writeInfo(duration: Double) {
@@ -269,5 +299,12 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
                 clusterStartoffsetRelativeTosegment.toInt()
             )
         }*/
+
+//for cues seekhead
+/*overwriteUInt32At(
+            output,
+            segmentStart+63,
+            500
+        )*/
 
 

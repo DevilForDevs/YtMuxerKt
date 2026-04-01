@@ -155,6 +155,22 @@ class Helper {
 
        return blockData
     }
+     fun encodeUInt(value: Long): ByteArray {
+        // Find minimal byte count
+        var v = value
+        var size = 1
+        while (v > 0xFF) {
+            size++
+            v = v shr 8
+        }
+
+        // Write big-endian bytes
+        val result = ByteArray(size)
+        for (i in 0 until size) {
+            result[size - 1 - i] = ((value shr (8 * i)) and 0xFF).toByte()
+        }
+        return result
+    }
 
 
 

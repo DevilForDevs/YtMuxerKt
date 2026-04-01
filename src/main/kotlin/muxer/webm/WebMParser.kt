@@ -138,6 +138,20 @@ class WebMParser(private val reader: RandomAccessFile,private val doLogging: Boo
        /* println(totalBlocks)*/
     }
 
+    fun printHexFromFile(raf: RandomAccessFile, position: Long, length: Int) {
+        val current = raf.filePointer
+
+        val buffer = ByteArray(length)
+        raf.seek(position)
+        raf.readFully(buffer)
+
+        buffer.forEachIndexed { i, b ->
+            println(String.format("%03d : %02X", i, b))
+        }
+
+        raf.seek(current) // restore pointer
+    }
+
     fun parseElements(startOffset: Long, endOffset: Long, depth: Int = 0) {
         var offset = startOffset
         while (offset < endOffset && offset < reader.length()) {
@@ -157,7 +171,9 @@ class WebMParser(private val reader: RandomAccessFile,private val doLogging: Boo
             }
             when (id) {
 
-                0x114D9B74L -> parseSeekHead(contentOffset, contentOffset + size,doLogging)
+                0x114D9B74L -> {
+                    parseSeekHead(contentOffset, contentOffset + size,doLogging)
+                }
 
                 // === Root Containers ===
                 0x1A45DFA3L -> parseElements(contentOffset, contentOffset + size, depth + 1) // EBML
