@@ -81,6 +81,11 @@ fun buildEbmlHeader(): ByteArray {
     return header.toByteArray()
 }
 
+data class ElementInfoForWriting(
+    val startOffset: Long,
+    val sizePos: Long
+)
+
 fun convertBytes(sizeInBytes: Long): String {
     val kilobyte = 1024
     val megabyte = kilobyte * 1024

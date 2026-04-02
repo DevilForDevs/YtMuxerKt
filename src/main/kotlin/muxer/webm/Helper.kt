@@ -170,11 +170,108 @@ class Helper {
             result[size - 1 - i] = ((value shr (8 * i)) and 0xFF).toByte()
         }
         return result
+     }
+
+    fun printHexFromFile(raf: RandomAccessFile, position: Long, length: Int) {
+        val current = raf.filePointer
+
+        val buffer = ByteArray(length)
+        raf.seek(position)
+        raf.readFully(buffer)
+
+        buffer.forEachIndexed { i, b ->
+            println(String.format("%03d : %02X", i, b))
+        }
+
+        raf.seek(current) // restore pointer
     }
 
+    fun writeSegmentHeader(output: RandomAccessFile): ElementInfoForWriting {
+        output.write(hexToBytes("18 53 80 67"))
+        val segmentSizePos = output.filePointer
+        output.write(ByteArray(8))
+        val segmentStart = output.filePointer
+        ElementInfoForWriting(
+            segmentStart,
+            segmentSizePos
+        )
+        return ElementInfoForWriting(
+            segmentStart,
+            segmentSizePos
+        )
+    }
 
+    fun patchSegment(output: RandomAccessFile, elementInfoForWriting: ElementInfoForWriting){
+        val segmentEnd = output.filePointer
+        val segmentSize = segmentEnd - elementInfoForWriting.startOffset
+        output.seek(elementInfoForWriting.sizePos)
+        output.write(encodeVInt8(segmentSize, 8))
+        output.seek(segmentEnd)
+    }
 
+    fun initiateSeekhead(output: RandomAccessFile): ElementInfoForWriting {
+        output.write(idToBytes(0x114D9B74)) // SeekHead ID
+        val seekHeadSizePos = output.filePointer
+        output.write(ByteArray(8)) // reserve size
+        val seekHeadStart = output.filePointer
+        return ElementInfoForWriting(
+            startOffset = seekHeadStart,
+            sizePos = seekHeadSizePos
+        )
+    }
 
+    fun patchSeekHead(output: RandomAccessFile, elementInfoForWriting: ElementInfoForWriting){
+        val seekHeadEnd = output.filePointer
+        val seekHeadSize = seekHeadEnd - elementInfoForWriting.startOffset
+        output.seek(elementInfoForWriting.sizePos)
+        output.write(encodeVInt8(seekHeadSize, 8))
+        output.seek(seekHeadEnd)
+    }
+
+    fun initiateVoidElement(
+        output: RandomAccessFile,
+        totalSize: Int
+    ): ElementInfoForWriting {
+
+        require(totalSize >= 9) { "Void needs at least 9 bytes (1 ID + 8 size)" }
+
+        val start = output.filePointer
+
+        // Void ID (0xEC)
+        output.writeByte(0xEC)
+
+        val sizePos = output.filePointer
+
+        // reserve 8-byte VINT size
+        output.write(ByteArray(8))
+
+        val payloadStart = output.filePointer
+
+        // fill remaining space (temporary)
+        val payloadSize = totalSize - (1 + 8)
+        output.write(ByteArray(payloadSize))
+
+        return ElementInfoForWriting(
+            startOffset = payloadStart,
+            sizePos = sizePos
+        )
+    }
+
+    fun patchVoidElement(
+        output: RandomAccessFile,
+        info: ElementInfoForWriting
+    ) {
+        val end = output.filePointer
+
+        val payloadSize = end - info.startOffset
+
+        output.seek(info.sizePos)
+
+        // Write EBML VINT (8 bytes like your segment)
+        output.write(encodeVInt8(payloadSize, 8))
+
+        output.seek(end)
+    }
 
 
 
