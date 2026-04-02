@@ -3,7 +3,6 @@ package muxer.webm
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.RandomAccessFile
-import kotlin.experimental.or
 
 
 class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val progress: (Samples: String, percent: Int) -> Unit = { _, _ -> } ) {
@@ -11,7 +10,7 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
      var totalBlocksFromAllSources=0
      val helper= Helper()
 
-
+    val CUE_RESERVE_SIZE: Int = 65535
     val listBuffer = mutableListOf<ByteArray>()
     var firstCluter: Long?=null
 
@@ -68,6 +67,32 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
         output.write(ebmlHeader)
     }
 
+    private fun writeSeekHead(infoPos: Long, tracksPos: Long, cuesPos: Long) {
+        output.write(helper.idToBytes(0x114D9B74)) // SeekHead ID
+        val seekHeadSizePos = output.filePointer
+        output.write(ByteArray(8)) // reserve size
+        val seekHeadStart = output.filePointer
+
+        val seekEntries = listOf(
+            0x1549A966L to infoPos,
+            0x1654AE6BL to tracksPos,
+            0x1C53BB6BL to cuesPos
+        )
+
+        for ((id, pos) in seekEntries) {
+            val seek = ByteArrayOutputStream()
+            seek.write(helper.writeElement(0x53AB, helper.idToBytes(id)))
+            seek.write(helper.writeElement(0x53AC, helper.encodeUInt(pos))) // relative to segment start
+            output.write(helper.writeElement(0x4DBB, seek.toByteArray()))
+        }
+
+        val seekHeadEnd = output.filePointer
+        val seekHeadSize = seekHeadEnd - seekHeadStart
+        output.seek(seekHeadSizePos)
+        output.write(helper.encodeVInt8(seekHeadSize, 8))
+        output.seek(seekHeadEnd)
+    }
+
 
 
     fun writeSegment() {
@@ -78,40 +103,7 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
         output.write(ByteArray(8)) // placeholder for segment size
         val segmentStart = output.filePointer
 
-
-
-
-
-        //seekelemnet startws
-        output.write(helper.idToBytes(0x114D9B74)) // SeekHead ID
-        val seekHeadSizePos = output.filePointer
-        output.write(ByteArray(8)) // reserve size
-        val seekHeadStart = output.filePointer
-
-        val seek = ByteArrayOutputStream()
-
-        val seekPosOffset = output.filePointer
-        seek.write(helper.writeElement(0x53AB, helper.idToBytes(0x1549A966L)))
-        seek.write(helper.writeElement(0x53AC, helper.encodeUInt(0))) // relative to segment start
-        output.write(helper.writeElement(0x4DBB, seek.toByteArray()))
-
-
-
-        val seekHeadEnd = output.filePointer
-        val seekHeadSize = seekHeadEnd - seekHeadStart
-        output.seek(seekHeadSizePos)
-        output.write(helper.encodeVInt8(seekHeadSize, 8))
-        output.seek(seekHeadEnd)
-
-        //seekelemnet ends
-
-
-        writeInfo(sources.maxOfOrNull { it.duration } ?: 0.0)
-        writeTracks()
-        writeClusters(segmentStart)
-
-
-
+        writeSeekHead(10L,50L,100L)
 
 
 
@@ -120,17 +112,10 @@ class WebmMuxer(outputFile: File, private val sources: List<WebMParser>, val pro
         val segmentSize = segmentEnd - segmentStart
         output.seek(segmentSizePos)
         val segmentSizeByte=helper.encodeVInt8(segmentSize, 8)
-        println(segmentSizeByte)
         output.write(segmentSizeByte)
         output.seek(segmentEnd)
 
         printHexFromFile(output,0,100)
-
-
-
-
-
-
 
 
     }

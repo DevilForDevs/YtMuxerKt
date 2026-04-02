@@ -28,11 +28,8 @@ fun main() {
 
     debugUsingFffmpeg(otfile)
 
-
-
-
-
 }
+
 
 fun muxWithFFmpeg(videoFile: File, audioFile: File, outputFile: File) {
     try {
@@ -88,6 +85,7 @@ fun debugUsingFffmpeg(outputFile: File){
         .directory(File(System.getProperty("user.dir"))) // optional working dir
         .start()
 }
+
 
 
 
